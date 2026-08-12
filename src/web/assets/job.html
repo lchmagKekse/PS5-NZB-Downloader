@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job details &mdash; PS5 NZB Downloader</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/pico.min.css">
+<link rel="stylesheet" href="/fontawesome.min.css">
+<link rel="stylesheet" href="/main.css">
+</head>
+<body>
+<header class="site-header">
+  <nav class="container-fluid">
+    <ul><li class="brand"><strong><img src="/favicon.svg" alt="" class="brand-icon"> PS5 NZB Downloader</strong><span class="version-tag">v0.1.0</span></li></ul>
+    <ul>
+      <li><a href="/" class="icon-link" title="Dashboard" aria-label="Dashboard"><i class="fa-solid fa-house fa-lg"></i></a></li>
+    </ul>
+  </nav>
+</header>
+
+<main class="container-fluid">
+  <p><a href="/"><i class="fa-solid fa-arrow-left"></i> Back to queue</a></p>
+
+  <article id="job-header">
+    <p class="muted">Loading&hellip;</p>
+  </article>
+
+  <article>
+    <h3 style="margin-top:0;">Files</h3>
+    <figure>
+      <table>
+        <thead>
+          <tr><th>Filename</th><th>Progress</th><th>Size</th></tr>
+        </thead>
+        <tbody id="file-rows"></tbody>
+      </table>
+    </figure>
+  </article>
+</main>
+
+<script src="/main.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const jobId = params.get('id');
+
+async function refresh() {
+  if (!jobId) {
+    document.getElementById('job-header').innerHTML = '<p class="error-line">No job id in URL.</p>';
+    return;
+  }
+
+  let job;
+  try {
+    job = await apiGet('/api/jobs/' + encodeURIComponent(jobId));
+  } catch (e) {
+    document.getElementById('job-header').innerHTML = `<p class="error-line">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+
+  const info = jobProgressInfo(job.progress);
+  document.getElementById('job-header').innerHTML = `
+    <h2 style="margin-top:0;">${escapeHtml(job.name)}</h2>
+    <div class="stats-grid">
+      <div class="stat"><div class="label">State</div><div class="value">${stateBadge(job.state)}</div></div>
+      <div class="stat"><div class="label">Progress</div><div class="value">${info.pct}%</div></div>
+      <div class="stat"><div class="label">Size</div><div class="value">${formatBytes(job.progress.total_bytes)}</div></div>
+      <div class="stat"><div class="label">Retries</div><div class="value">${job.retries_used}</div></div>
+    </div>
+    <div style="margin-top:12px;">${progressBarHtml(job)}</div>
+    ${job.output_dir ? `<p class="muted" style="margin-top:12px;">${escapeHtml(job.output_dir)}/${escapeHtml(job.name)}</p>` : ''}
+    ${job.last_error ? `<p class="error-line" style="margin-top:12px;">${escapeHtml(job.last_error)}</p>` : ''}
+  `;
+
+  document.getElementById('file-rows').innerHTML = job.files.map(f => {
+    const fpct = f.segment_count ? Math.round((f.downloaded_segment_count / f.segment_count) * 100) : 0;
+    return `<tr>
+      <td data-label="Filename">${escapeHtml(f.filename)}</td>
+      <td data-label="Progress">
+        <progress value="${fpct}" max="100"></progress>
+        <span class="progress-label">${f.downloaded_segment_count}/${f.segment_count} segments</span>
+      </td>
+      <td data-label="Size">${formatBytes(f.bytes)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="3" class="muted">No files.</td></tr>';
+}
+
+window.refreshNow = refresh;
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

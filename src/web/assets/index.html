@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS5 NZB Downloader</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/pico.min.css">
+<link rel="stylesheet" href="/fontawesome.min.css">
+<link rel="stylesheet" href="/main.css">
+</head>
+<body>
+<header class="site-header">
+  <nav class="container-fluid">
+    <ul><li class="brand"><strong><img src="/favicon.svg" alt="" class="brand-icon"> PS5 NZB Downloader</strong><span class="version-tag">v0.1.0</span></li></ul>
+    <ul>
+      <li><a href="/settings.html" class="icon-link" title="Settings" aria-label="Settings"><i class="fa-solid fa-gear fa-lg"></i></a></li>
+    </ul>
+  </nav>
+</header>
+
+<main class="container-fluid">
+  <article>
+    <div class="stats-grid" id="stats">
+      <div class="stat"><div class="label"><i class="fa-solid fa-layer-group"></i> Queue</div><div class="value" id="stat-queue">-</div></div>
+      <div class="stat"><div class="label"><i class="fa-solid fa-gauge-high"></i> Speed</div><div class="value" id="stat-speed">-</div></div>
+      <div class="stat"><div class="label"><i class="fa-solid fa-ethernet"></i> Connections</div><div class="value" id="stat-conns">-</div></div>
+      <label class="dropzone stat" id="dropzone" for="nzb-files">
+        <i class="fa-solid fa-cloud-arrow-up"></i>
+        <div>Drag &amp; drop .nzb files here, or click to browse</div>
+        <input type="file" id="nzb-files" name="nzb" accept=".nzb,application/x-nzb,text/xml" multiple>
+      </label>
+    </div>
+  </article>
+
+  <article>
+    <figure class="table-scroll">
+      <table class="jobs-table">
+        <thead>
+          <tr><th>Name</th><th>State</th><th>Progress</th><th>Size</th><th></th></tr>
+        </thead>
+        <tbody id="job-rows">
+          <tr><td colspan="5" class="muted">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </figure>
+  </article>
+
+  <article>
+    <div class="panel-header">
+      <h3><i class="fa-solid fa-terminal"></i> Logs</h3>
+      <a href="/api/logs/download" download>
+        <i class="fa-solid fa-download fa-xl"></i>
+      </a>
+    </div>
+    <div class="log-viewer" id="logs">Loading&hellip;</div>
+  </article>
+</main>
+
+<dialog id="confirm-modal">
+  <article>
+    <header>
+      <strong id="confirm-modal-title">Confirm</strong>
+    </header>
+    <p id="confirm-modal-message"></p>
+    <footer>
+      <button type="button" class="secondary" data-modal-cancel>Cancel</button>
+      <button type="button" id="confirm-modal-confirm">Confirm</button>
+    </footer>
+  </article>
+</dialog>
+
+<dialog id="rename-modal">
+  <article>
+    <header>
+      <strong>Add this download</strong>
+    </header>
+    <label for="rename-input">Name</label>
+    <input type="text" id="rename-input">
+    <small class="muted">Used as the job name and the output folder name.</small>
+
+    <label for="rename-output-dir">Output folder</label>
+    <input type="text" id="rename-output-dir">
+    <small class="muted">Final destination once the download completes.</small>
+
+    <label class="shadowmount-row" for="rename-shadowmount">
+      <input type="checkbox" id="rename-shadowmount">
+      Add path to ShadowMountPlus
+    </label>
+
+    <footer>
+      <button type="button" class="secondary" data-modal-cancel>Cancel</button>
+      <button type="button" id="rename-modal-confirm">Add</button>
+    </footer>
+  </article>
+</dialog>
+
+<script src="/main.js"></script>
+<script>
+/* Upload rejections (wrong extension, malformed NZB, server error) never
+ * touch the backend's own log ring buffer -- either they're caught
+ * client-side before any request goes out, or the server rejects the
+ * upload without logging it itself. Kept here and merged into the same
+ * log box on every refresh so they show up in the one place the user is
+ * already watching. Capped so a bad drag-and-drop session can't grow this
+ * forever. */
+let lastServerLogs = [];
+const clientLogLines = [];
+const MAX_CLIENT_LOG_LINES = 50;
+
+function logTimestamp() {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function renderLogsView() {
+  renderLogLines(document.getElementById('logs'), [...lastServerLogs, ...clientLogLines]);
+}
+
+/* Not a terminal state -- still queued, actively downloading, or in one
+ * of the post-download phases. This is what "Queue" counts, same set the
+ * old separate "Active jobs" tile drew from (see api_status.c's
+ * active_jobs, JOB_DOWNLOADING/VERIFYING/EXTRACTING) but broader --
+ * queued and paused jobs are just as much "up for downloading" as ones
+ * currently mid-transfer, so that tile is gone and this replaces it. */
+const PENDING_STATES = ['queued', 'downloading', 'paused', 'verifying', 'repairing', 'extracting'];
+
+async function refresh() {
+  try {
+    const status = await apiGet('/api/status');
+    window.__lastSpeed = status.download_speed_bytes_per_sec;
+
+    document.getElementById('stat-speed').textContent = formatSpeed(status.download_speed_bytes_per_sec);
+    document.getElementById('stat-conns').textContent = status.active_connections + ' / ' + status.max_connections;
+
+    const jobs = await apiGet('/api/jobs');
+    document.getElementById('stat-queue').textContent = jobs.filter(j => PENDING_STATES.includes(j.state)).length;
+
+    const rows = document.getElementById('job-rows');
+    if (!jobs.length) {
+      rows.innerHTML = '<tr><td colspan="5" class="muted">Queue is empty</td></tr>';
+    } else {
+      rows.innerHTML = jobs.map(j => `<tr>
+          <td data-label="Name"><a href="/job.html?id=${encodeURIComponent(j.id)}">${escapeHtml(j.name)}</a></td>
+          <td data-label="State">${stateBadge(j.state)}</td>
+          <td data-label="Progress">${progressBarHtml(j)}</td>
+          <td data-label="Size">${formatBytes(j.progress.total_bytes)}</td>
+          <td data-label="Actions">${jobActionButtons(j)}</td>
+        </tr>`).join('');
+    }
+
+    lastServerLogs = await apiGet('/api/logs');
+    renderLogsView();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+window.refreshNow = refresh;
+
+function logUploadError(filename, message) {
+  clientLogLines.push(`${logTimestamp()} [ERROR] upload: ${filename}: ${message}`);
+  if (clientLogLines.length > MAX_CLIENT_LOG_LINES) clientLogLines.shift();
+  renderLogsView();
+}
+
+/* One file at a time (the upload endpoint takes a single NZB per POST,
+ * see api_jobs_create()) -- each valid .nzb gets its own rename-on-add
+ * modal before uploading, so drop order stays predictable rather than a
+ * pile of modals queuing up at once. */
+async function queueFiles(fileList) {
+  const files = Array.from(fileList);
+  if (!files.length) return;
+
+  /* Fetched once per drop/browse batch, not once per file -- the "Output
+   * folder" field's autofill should reflect whatever is currently
+   * configured in Settings at the moment the user is adding these NZBs,
+   * not stale per-file. */
+  let defaultOutputDir = '';
+  try {
+    const cfg = await apiGet('/api/config');
+    defaultOutputDir = (cfg.storage && cfg.storage.output_dir) || '';
+  } catch (e) {
+    console.error(e);
+  }
+
+  for (const file of files) {
+    if (!/\.nzb$/i.test(file.name)) {
+      logUploadError(file.name, 'Not a .nzb file');
+      continue;
+    }
+
+    const choice = await renamePrompt(suggestJobName(file.name), defaultOutputDir);
+    if (choice === null) continue;
+
+    try {
+      const fd = new FormData();
+      fd.append('nzb', file, file.name);
+      fd.append('display_name', choice.name);
+      fd.append('output_dir', choice.outputDir);
+      fd.append('add_to_shadowmount', choice.shadowmount ? '1' : '0');
+      const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
+    } catch (err) {
+      logUploadError(file.name, err.message);
+    }
+  }
+
+  refresh();
+}
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('nzb-files');
+
+fileInput.addEventListener('change', () => {
+  queueFiles(fileInput.files);
+  fileInput.value = '';
+});
+
+['dragenter', 'dragover'].forEach(evt => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+  });
+});
+['dragleave', 'dragend'].forEach(evt => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+  });
+});
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer && e.dataTransfer.files.length) queueFiles(e.dataTransfer.files);
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

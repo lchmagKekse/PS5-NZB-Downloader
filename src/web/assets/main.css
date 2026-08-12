@@ -1,0 +1,354 @@
+/* Project-specific styling layered on top of pico.min.css + fontawesome.min.css
+ * (both loaded before this file, see index.html/job.html/settings.html head).
+ * Pico already styles bare <table>, <button>, <progress>, <article>, <nav>,
+ * form elements etc, so this file only covers what Pico has no opinion on:
+ * stat tiles, state badges, icon-only action buttons, the upload dropzone,
+ * the log viewer, and the small-screen table-to-card collapse. */
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/roboto-400.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/roboto-500.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(/roboto-700.woff2) format('woff2');
+}
+
+:root {
+  --pico-font-family-sans-serif: 'Roboto', system-ui, "Segoe UI", Helvetica, Arial, sans-serif, var(--pico-font-family-emoji);
+  --pico-font-weight: 500;
+}
+
+/* Pico underlines links by default (color-matched to --pico-primary-
+ * underline) -- doesn't read well here, so it's turned off globally.
+ * !important because Pico's own :hover/:focus/:active state re-asserts
+ * the underline with higher selector specificity than a plain `a` rule
+ * can beat on source order alone. */
+a, [role=link] { text-decoration: none !important; }
+
+.site-header {
+  /* Pico's `body>header{padding-block:var(--pico-block-spacing-vertical)}`
+   * (20px+20px) stacks with the <nav>'s own padding below, which is what
+   * was actually blowing the header out past 100px tall -- zeroed here so
+   * only the nav padding (deliberately kept compact) governs its height. */
+  padding-block: 0;
+  border-bottom: 1px solid var(--pico-muted-border-color);
+  margin-bottom: 0;
+}
+.site-header nav {
+  /* Pico's own <li> padding (--pico-nav-element-spacing-vertical, 1rem
+   * default) stacks with this, so both need trimming -- left at defaults
+   * the header came out well over 100px tall for one line of content. */
+  padding-block: .4rem;
+  --pico-nav-element-spacing-vertical: .3rem;
+}
+.site-header .brand { display: inline-flex; align-items: baseline; gap: .5rem; }
+.site-header .brand-icon { width: 1.7em; height: 1.7em; vertical-align: -0.4em; }
+.site-header .version-tag {
+  font-size: .7rem;
+  font-weight: 400;
+  color: var(--pico-muted-color);
+}
+.site-header .icon-link {
+  color: var(--pico-primary);
+  padding: .25rem;
+  line-height: 1;
+}
+.site-header .icon-link:hover { color: var(--pico-primary-hover); }
+
+/* container-fluid, not container -- Pico's plain .container caps out at
+ * max-width:1450px past the 1536px breakpoint (950px/1200px at smaller
+ * ones), leaving a lot of dead space on the sides on a normal monitor.
+ * -fluid only pads by --pico-spacing on each side, no cap. */
+main.container-fluid { padding-block: 1.5rem; }
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: .75rem;
+  margin: 0;
+}
+.stat {
+  background: var(--pico-card-sectioning-background-color);
+  border-radius: var(--pico-border-radius);
+  padding: .6rem 1rem;
+  min-width: 140px;
+}
+.stat .label {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  color: var(--pico-muted-color);
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.stat .value { font-size: 1.3rem; font-weight: 600; margin-top: .2rem; }
+
+progress { margin-bottom: .3rem; }
+.progress-label { font-size: .8rem; color: var(--pico-muted-color); white-space: nowrap; }
+td[data-label="Progress"] { min-width: 170px; }
+
+/* Every table here lives inside an <article>/<figure> card, never
+ * free-floating on the page -- but Pico's own td/th rule paints each cell
+ * with --pico-background-color (the *page* background), which in dark
+ * mode is a visibly darker shade than the card's own
+ * --pico-card-background-color. Left alone that reads as a mismatched
+ * hole cut into the card on desktop, where the table stays a real
+ * <table> -- the <640px collapse below already went transparent here (for
+ * its own "sit on the card" reason, see that rule's comment), which is
+ * why the table only ever looked right on mobile. Applies to every table,
+ * not just .jobs-table, so job.html's Files table matches too. */
+table td, table th { background: transparent; }
+
+/* Only the Name column should ever give up width -- State/Progress/Size/
+ * Actions get fixed widths sized to their worst-case content (longest
+ * badge, longest progress label, 3 icon buttons) so they never wrap.
+ * table-layout:fixed makes those widths (set on the header cells) the
+ * real column widths, with Name absorbing whatever's left. Desktop only
+ * -- below 640px the table collapses to stacked cards (see below) where
+ * a fixed width would just clip the cards.
+ *
+ * rem, not px: Pico scales the root font-size up on wider viewports
+ * (fluid typography), and everything that fills these columns -- badges,
+ * icon buttons, progress labels -- is sized in rem too, so it scales
+ * right along with that. Fixed *pixel* widths didn't, and fell short of
+ * 3 icon buttons' actual (larger, at a bigger root size) rendered width,
+ * which is what was wrapping Actions onto two lines. */
+@media (min-width: 641px) {
+  /* min-width, not just width -- table-layout:fixed splits whatever width
+   * the table ends up with between the columns, so on a narrow-but-still-
+   * desktop viewport a plain width:100% would starve the Name column down
+   * to almost nothing (the other four columns' widths alone add up to
+   * 43rem) and send its text into character-by-character wrapping. Below
+   * this min-width, .table-scroll (the <figure> wrapper) scrolls
+   * horizontally instead of squeezing Name any further. */
+  .jobs-table { table-layout: fixed; width: 100%; min-width: 60rem; }
+  .jobs-table th:nth-child(1), .jobs-table td:nth-child(1) {
+    width: auto;
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+  .jobs-table th:nth-child(2), .jobs-table td:nth-child(2) { width: 9rem; }
+  .jobs-table th:nth-child(3), .jobs-table td:nth-child(3) { width: 17rem; }
+  .jobs-table th:nth-child(4), .jobs-table td:nth-child(4) { width: 6rem; white-space: nowrap; }
+  /* 3 icon buttons (2.15rem each) + 2 gaps (.35rem) = 7.15rem of content,
+   * plus the cell's own padding (1rem each side, from Pico's td/th rule)
+   * = 9.15rem -- 11rem leaves real headroom instead of running right up
+   * against the edge. */
+  .jobs-table th:nth-child(5), .jobs-table td:nth-child(5) { width: 11rem; }
+  .table-scroll { overflow-x: auto; }
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .15rem .6rem;
+  border-radius: 999px;
+  font-size: .75rem;
+  white-space: nowrap;
+  background: var(--pico-card-sectioning-background-color);
+  color: var(--pico-muted-color);
+}
+.badge.downloading, .badge.verifying, .badge.repairing, .badge.extracting {
+  background: color-mix(in srgb, var(--pico-primary) 15%, transparent);
+  color: var(--pico-primary);
+}
+.badge.completed { background: color-mix(in srgb, #3ecf8e 20%, transparent); color: #2fae77; }
+.badge.failed { background: color-mix(in srgb, #e05c5c 18%, transparent); color: #e05c5c; }
+.badge.paused, .badge.cancelled { background: color-mix(in srgb, #e0a93e 18%, transparent); color: #c98f22; }
+
+.actions { display: flex; gap: .35rem; flex-wrap: wrap; }
+.icon-btn {
+  --pico-spacing: 0;
+  width: 2.15rem;
+  height: 2.15rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pico-border-radius);
+  margin: 0;
+}
+/* Persistent styling: every icon button stays solid-filled with a white
+ * icon always, danger (cancel/remove) included -- just red instead of
+ * primary-blue, same as pause/resume/retry are (Pico's default button
+ * look). Hover only darkens the fill a bit, same as Pico's own primary
+ * hover does; it never switches to an outline/transparent look. */
+.icon-btn.danger {
+  color: #fff;
+  border-color: #e05c5c;
+  background: #e05c5c;
+}
+.icon-btn.danger:hover, .icon-btn.danger:focus {
+  color: #fff;
+  border-color: color-mix(in srgb, #e05c5c 85%, black);
+  background: color-mix(in srgb, #e05c5c 85%, black);
+}
+
+.dropzone {
+  /* transparent, not "no border" -- keeps the same 2px of layout space
+   * reserved so the box doesn't shift size when the border color below
+   * actually appears on hover/dragover. */
+  border: 2px dashed transparent;
+  border-radius: var(--pico-border-radius);
+  padding: 2.5rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  color: var(--pico-muted-color);
+  transition: border-color .15s ease, background-color .15s ease;
+}
+.dropzone i.fa-cloud-arrow-up {
+  display: block;
+  font-size: 2.25rem;
+  margin-bottom: .6rem;
+  color: var(--pico-primary);
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--pico-primary);
+  background: color-mix(in srgb, var(--pico-primary) 6%, transparent);
+}
+.dropzone input[type=file] { display: none; }
+.dropzone .hint { font-size: .8rem; margin-top: .3rem; }
+
+/* Dropzone doubles as the 4th tile in .stats-grid, alongside Queue/Speed/
+ * Connections -- .stat gives it the shared background/flex-basis, this
+ * trims its (otherwise much taller, block-stacked) padding/layout down to
+ * match those tiles' height instead of towering over them. */
+.stats-grid .dropzone {
+  /* height:100%, not just align-self:stretch -- as a <label> wrapping a
+   * hidden file input, this item's auto-stretch across the grid row falls
+   * short of the other tiles' height by a few px in testing, so the row
+   * height is filled explicitly instead of relying on grid's auto sizing. */
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .6rem;
+  padding: .6rem 1rem;
+  text-align: left;
+}
+.stats-grid .dropzone i.fa-cloud-arrow-up {
+  display: inline;
+  margin-bottom: 0;
+  font-size: 1.4rem;
+}
+.stats-grid .dropzone div { font-size: .8rem; line-height: 1.25; }
+
+.field-row {
+  display: grid;
+  gap: 0 1rem;
+  align-items: start;
+  margin-bottom: 1rem;
+}
+.field-row:last-of-type { margin-bottom: 0; }
+.field-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.field-row.cols-2 { grid-template-columns: repeat(2, 1fr); }
+.field-row.cols-1 { grid-template-columns: 1fr; }
+
+/* The TLS/SSL checkbox has no natural "input box" to give it the same
+ * height as a text field, so it mirrors a normal field's label+input
+ * structure exactly: an invisible label of the same height standing in
+ * for the visible one, then a box sized like an input (via the same
+ * padding/border pico gives real inputs) so the checkbox+label inside it
+ * lines up vertically with the text inputs beside it -- not just bottom-
+ * or top-aligned with them. */
+.field.checkbox .spacer { visibility: hidden; }
+.field.checkbox .checkbox-box {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-height: calc(1.5rem + 2 * var(--pico-form-element-spacing-vertical) + 2 * var(--pico-border-width));
+}
+.field.checkbox .checkbox-box label { margin: 0; }
+
+.muted { color: var(--pico-muted-color); }
+.error-line { color: #e05c5c; font-family: monospace; font-size: .8rem; white-space: pre-wrap; }
+
+.log-viewer {
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--pico-card-sectioning-background-color);
+  border-radius: var(--pico-border-radius);
+  padding: .6rem .8rem;
+  font-family: var(--pico-font-family-monospace);
+  font-size: .78rem;
+  line-height: 1.5;
+}
+.log-viewer .log-line { white-space: pre-wrap; word-break: break-word; }
+.log-line.level-error { color: #e05c5c; }
+.log-line.level-warn { color: #e0a93e; }
+.log-line.level-debug { color: var(--pico-muted-color); }
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  margin-bottom: var(--pico-typography-spacing-vertical);
+}
+.panel-header h3 { margin: 0; }
+.panel-header a {
+  color: var(--pico-primary);
+  line-height: 1;
+}
+.panel-header a:hover { color: var(--pico-primary-hover); }
+
+@media (max-width: 700px) {
+  .field-row.cols-2, .field-row.cols-3 {
+    grid-template-columns: 1fr;
+    gap: 1rem 0;
+  }
+  .field.checkbox { padding-bottom: 0; }
+}
+
+@media (max-width: 640px) {
+  table, thead, tbody, tr, th, td { display: block; }
+  thead { display: none; }
+  tr { border-bottom: 1px solid var(--pico-muted-border-color); padding: .5rem 0; }
+  /* Pico's own td/th rule sets background-color:var(--pico-background-color)
+   * (needed for real table rows) -- once collapsed to blocks here that
+   * paints a flush-edge-to-edge box behind each field with no inset,
+   * which reads as a stray, oddly-placed panel rather than a table cell.
+   * Dropping it lets each row just sit on the card's own background. */
+  td, th { border: none; padding: .25rem 0; background: transparent; }
+  td::before {
+    content: attr(data-label);
+    color: var(--pico-muted-color);
+    font-size: .7rem;
+    display: block;
+    text-transform: uppercase;
+  }
+}
+
+/* Native <dialog>, styled by Pico's dialog>article rules (see
+ * index.html's #confirm-modal/#rename-modal) -- .danger below is the one
+ * bit Pico has no opinion on, for the destructive-action confirm button. */
+#confirm-modal-confirm.danger {
+  background: #e05c5c;
+  border-color: #e05c5c;
+}
+#confirm-modal-confirm.danger:hover, #confirm-modal-confirm.danger:focus {
+  background: color-mix(in srgb, #e05c5c 85%, black);
+  border-color: color-mix(in srgb, #e05c5c 85%, black);
+}
+/* Pico's default form-element margin-bottom already spaces the modal's
+ * stacked label/input pairs apart -- this just pulls each field's own
+ * "muted" helper text up snug against its input instead of matching that
+ * same full spacing twice in a row. */
+#rename-modal small { display: block; margin: -.5rem 0 1rem; }
+#rename-modal .shadowmount-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings &mdash; PS5 NZB Downloader</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/pico.min.css">
+<link rel="stylesheet" href="/fontawesome.min.css">
+<link rel="stylesheet" href="/main.css">
+</head>
+<body>
+<header class="site-header">
+  <nav class="container-fluid">
+    <ul><li class="brand"><strong><img src="/favicon.svg" alt="" class="brand-icon"> PS5 NZB Downloader</strong><span class="version-tag">v0.1.0</span></li></ul>
+    <ul>
+      <li><a href="/" class="icon-link" title="Dashboard" aria-label="Dashboard"><i class="fa-solid fa-house fa-lg"></i></a></li>
+    </ul>
+  </nav>
+</header>
+
+<main class="container-fluid">
+  <form id="settings-form">
+    <article>
+      <h3 style="margin-top:0;">Server</h3>
+      <div class="field-row cols-3">
+        <div class="field"><label>Hostname</label><input type="text" name="nntp.host" required></div>
+        <div class="field"><label>Port</label><input type="text" name="nntp.port" required></div>
+        <div class="field checkbox">
+          <label class="spacer" aria-hidden="true">&nbsp;</label>
+          <div class="checkbox-box"><input type="checkbox" id="tls" name="nntp.tls"><label for="tls">TLS/SSL</label></div>
+        </div>
+      </div>
+      <div class="field-row cols-2">
+        <div class="field"><label>Username</label><input type="text" name="nntp.user"></div>
+        <div class="field"><label>Password</label><input type="password" name="nntp.password" placeholder="*********"></div>
+      </div>
+      <div class="field-row cols-2">
+        <div class="field"><label>Simultaneous connections</label><input type="number" min="1" max="50" name="nntp.max_connections" required></div>
+        <div class="field"><label>Auto-retry attempts</label><input type="number" min="0" max="20" name="queue.max_retries" required></div>
+      </div>
+      <p class="muted" style="margin-top:10px;">Connection settings apply immediately if nothing is downloading, otherwise as soon as the current download finishes.</p>
+    </article>
+
+    <article>
+      <h3 style="margin-top:0;">Storage</h3>
+      <div class="field-row cols-2">
+        <div class="field"><label>Output directory</label><input type="text" name="storage.output_dir" required></div>
+        <div class="field"><label>Temp directory</label><input type="text" name="storage.temp_dir" required></div>
+      </div>
+      <p class="muted" style="margin-top:10px;">Each job downloads into its own subdirectory under temp directory. Once complete, files are moved/extracted into output directory</p>
+    </article>
+
+    <p>
+      <button type="submit"><i class="fa-solid fa-floppy-disk"></i> Save settings</button>
+      <span id="save-status" class="muted"></span>
+    </p>
+  </form>
+</main>
+
+<script src="/main.js"></script>
+<script>
+const form = document.getElementById('settings-form');
+
+function fieldByName(name) { return form.querySelector(`[name="${name}"]`); }
+
+function setField(name, value) {
+  const el = fieldByName(name);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value == null ? '' : value;
+}
+
+function getField(name) {
+  const el = fieldByName(name);
+  if (!el) return undefined;
+  if (el.type === 'checkbox') return el.checked;
+  if (el.type === 'number') return el.value === '' ? undefined : Number(el.value);
+  return el.value;
+}
+
+async function load() {
+  const cfg = await apiGet('/api/config');
+  for (const k of Object.keys(cfg.nntp)) setField('nntp.' + k, cfg.nntp[k]);
+  for (const k of Object.keys(cfg.storage)) setField('storage.' + k, cfg.storage[k]);
+  for (const k of Object.keys(cfg.queue)) setField('queue.' + k, cfg.queue[k]);
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const status = document.getElementById('save-status');
+
+  const body = {
+    nntp: {
+      host: getField('nntp.host'),
+      port: getField('nntp.port'),
+      tls: getField('nntp.tls'),
+      user: getField('nntp.user'),
+      password: getField('nntp.password'),
+      max_connections: getField('nntp.max_connections'),
+    },
+    storage: {
+      output_dir: getField('storage.output_dir'),
+      temp_dir: getField('storage.temp_dir'),
+    },
+    queue: {
+      max_retries: getField('queue.max_retries'),
+    },
+  };
+
+  status.textContent = 'Saving…';
+  try {
+    await apiPost('/api/config', body);
+    status.textContent = 'Saved.';
+  } catch (err) {
+    status.textContent = 'Failed: ' + err.message;
+  }
+});
+
+load().catch(e => {
+  document.getElementById('save-status').textContent = 'Failed to load: ' + e.message;
+});
+</script>
+</body>
+</html>
