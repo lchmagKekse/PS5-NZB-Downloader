@@ -253,6 +253,43 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url, const char *
   return MHD_NO;
 }
 
+/* Creates, binds and starts listening on the accept() socket used by the
+ * manual loop below. Split out of httpd_listen() so a dead listening
+ * socket (see the retry loop's comment) can be torn down and rebuilt
+ * without restarting the MHD daemon itself. */
+static int
+open_listen_socket(unsigned short port) {
+  struct sockaddr_in addr = {0};
+  struct timeval tv = { .tv_sec = 1 };
+  int fd;
+
+  if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    log_error("httpd: socket: %s", strerror(errno));
+    return -1;
+  }
+
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(port);
+
+  if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+    log_error("httpd: bind(:%u): %s", port, strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  if (listen(fd, 16) != 0) {
+    log_error("httpd: listen: %s", strerror(errno));
+    close(fd);
+    return -1;
+  }
+
+  return fd;
+}
+
 static void
 on_request_completed(void *cls, struct MHD_Connection *conn, void **con_cls,
                       enum MHD_RequestTerminationCode toe) {
@@ -275,34 +312,10 @@ httpd_stop(void) {
 
 int
 httpd_listen(unsigned short port) {
-  struct sockaddr_in addr = {0};
   struct MHD_Daemon *httpd;
-  struct timeval tv = { .tv_sec = 1 };
   int srvfd;
 
-  if ((srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    log_error("httpd: socket: %s", strerror(errno));
-    return -1;
-  }
-
-  setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
-  setsockopt(srvfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(port);
-
-  if (bind(srvfd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-    log_error("httpd: bind(:%u): %s", port, strerror(errno));
-    close(srvfd);
-    return -1;
-  }
-
-  if (listen(srvfd, 16) != 0) {
-    log_error("httpd: listen: %s", strerror(errno));
-    close(srvfd);
-    return -1;
-  }
+  if ((srvfd = open_listen_socket(port)) < 0) return -1;
 
   /* Explicit stack size for the same reason as nntp_pool's workers
    * (nntp_pool.c): default-attribute threads crashed with stack overflow. */
@@ -327,8 +340,13 @@ httpd_listen(unsigned short port) {
 
     if (connfd < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-      log_error("httpd: accept: %s", strerror(errno));
-      break;
+      log_warn("httpd: accept: %s - rebuilding listening socket", strerror(errno));
+      close(srvfd);
+      srvfd = -1;
+      while (!g_stop && (srvfd = open_listen_socket(port)) < 0) sleep(1);
+      if (g_stop) break;
+      log_info("httpd: listening socket rebuilt, resuming on port %u", port);
+      continue;
     }
 
     if (MHD_add_connection(httpd, connfd, (struct sockaddr *)&client_addr, addr_len) != MHD_YES) {
