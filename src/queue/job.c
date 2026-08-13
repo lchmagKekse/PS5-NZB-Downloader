@@ -7,6 +7,7 @@
 
 #include "../log/log.h"
 #include "../storage/paths.h"
+#include "../util/notify.h"
 #include "../vendor/cjson/cJSON.h"
 #include "job.h"
 
@@ -129,6 +130,19 @@ void
 job_set_state(job_t *job, job_state_t state) {
   log_info("[%s] state %s -> %s", job->id, job_state_name(job->state), job_state_name(state));
   job->state = state;
+
+  switch (state) {
+    case JOB_QUEUED:      notify("Queued: %s", job->name);      break;
+    case JOB_DOWNLOADING: notify("Downloading: %s", job->name); break;
+    case JOB_PAUSED:      notify("Paused: %s", job->name);      break;
+    case JOB_VERIFYING:   notify("Verifying: %s", job->name);   break;
+    case JOB_REPAIRING:   notify("Repairing: %s", job->name);   break;
+    case JOB_EXTRACTING:  notify("Extracting: %s", job->name);  break;
+    case JOB_COMPLETED:   notify("Finished: %s", job->name);    break;
+    case JOB_FAILED:      notify("Failed: %s", job->name);      break;
+    case JOB_CANCELLED:   notify("Cancelled: %s", job->name);   break;
+    default: break;
+  }
 }
 
 int

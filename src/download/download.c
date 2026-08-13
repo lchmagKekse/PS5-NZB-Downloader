@@ -27,7 +27,6 @@
 #include "../storage/paths.h"
 #include "../storage/shadowmount.h"
 #include "../util/crc32.h"
-#include "../util/notify.h"
 #include "../web/app_state.h"
 #include "../yenc/yenc.h"
 #include "download.h"
@@ -953,7 +952,6 @@ finalize_job(job_t *job, char *err, size_t err_size) {
   job_set_state(job, JOB_EXTRACTING);
   queue_save_job(g_app.queue, job);
   queue_unlock();
-  notify("Extracting: %s", job->name);
 
   extract_lock();
   snprintf(g_app.extract_job_id, sizeof g_app.extract_job_id, "%s", job->id);
@@ -1071,7 +1069,6 @@ download_job(finalize_queue_t *fq, job_t *job) {
              job->id, job->name, job->file_count, needed);
     log_info("[%s] download: space check on temp dir %s: %lld bytes needed, %lld available",
              job->id, temp_dir, needed, free_bytes);
-    notify("Downloading: %s", job->name);
 
     /* free_bytes < 0 means the check itself failed (e.g. statfs error) --
      * proceed rather than block on a check we couldn't perform; a
@@ -1232,7 +1229,6 @@ finalizer_main(void *arg) {
     }
 
     log_info("[%s] download (%s): completed", job->id, job->name);
-    notify("Finished: %s", job->name);
     queue_lock();
     job_set_state(job, JOB_COMPLETED);
     queue_save_job(g_app.queue, job);
