@@ -92,8 +92,11 @@ typedef struct {
 
 /* Progress callback invoked as bytes are read during par2_verify_file() --
  * may fire once per read() chunk, keep it cheap. bytes_done is cumulative
- * across calls sharing one par2_progress_t. May be NULL. */
-typedef void (*par2_progress_cb)(void *ctx, long long bytes_done, long long bytes_total);
+ * across calls sharing one par2_progress_t. May be NULL. Return nonzero to
+ * abort: par2_verify_file()/par2_repair_set() stop at the next opportunity
+ * and return -1 (used by api_system_eject() to cut a long verify/repair
+ * pass short). */
+typedef int (*par2_progress_cb)(void *ctx, long long bytes_done, long long bytes_total);
 
 /* Shared across every file verified in one job's pass so bytes_done
  * keeps accumulating from one file to the next rather than resetting.

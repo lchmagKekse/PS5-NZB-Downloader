@@ -88,7 +88,7 @@ main(int argc, char **argv) {
    * be read, so it's always safe to use afterward -- first run just
    * means an empty NNTP host until the user sets one via Settings. */
   if (app_config_load(cfgpath, &cfg) < 0) {
-    log_warn("main: no usable config at %s yet -- starting with defaults, configure via the Settings page", cfgpath);
+    log_warn("main: no usable config at %s yet - starting with defaults, configure via the Settings page", cfgpath);
   }
 
   if (!(queue = queue_open(DEFAULT_QUEUE_DIR, cfg.storage.temp_dir))) {

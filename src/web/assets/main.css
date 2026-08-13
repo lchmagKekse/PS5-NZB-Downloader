@@ -352,3 +352,8 @@ table td, table th { background: transparent; }
  * same full spacing twice in a row. */
 #rename-modal small { display: block; margin: -.5rem 0 1rem; }
 #rename-modal .shadowmount-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
+
+button.danger {
+  background: #e05c5c;
+  border-color: #e05c5c;
+}

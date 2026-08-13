@@ -32,8 +32,10 @@ typedef enum {
  * may fire once per libarchive read/write block, so keep it cheap.
  * bytes_done is cumulative across all archive sets; bytes_total is the
  * real decompressed size (read from archive headers, same basis as
- * bytes_done) so done never exceeds total. May be NULL. */
-typedef void (*extract_progress_cb)(void *ctx, long long bytes_done, long long bytes_total);
+ * bytes_done) so done never exceeds total. May be NULL. Return nonzero to
+ * abort: extract_job() stops at the next block and returns EXTRACT_FAILED
+ * (used by api_system_eject() to cut a long extraction short). */
+typedef int (*extract_progress_cb)(void *ctx, long long bytes_done, long long bytes_total);
 
 /* Scans job's files in src_dir for the starting volume of an archive
  * (multi-volume RAR old/new-style, multi-volume 7z, or single-file

@@ -122,7 +122,7 @@ api_config_post(struct MHD_Connection *conn, const char *body, size_t body_len) 
   /* Applied by app_reload_pool_if_needed(), called between jobs (never
    * mid-download, see app_state.h). */
   if (nntp_changed) {
-    log_info("api_config: NNTP settings changed -- pool will be rebuilt automatically "
+    log_info("api_config: NNTP settings changed - pool will be rebuilt automatically "
              "(now if idle, otherwise once the current download finishes)");
   }
 

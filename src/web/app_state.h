@@ -31,6 +31,16 @@ typedef struct {
   pthread_mutex_t  pool_mu;
   int              pool_reload_needed; /* guarded by config_mu; see api_config_post() */
 
+  /* Set once by api_system_eject() (POST /api/eject) and never cleared --
+   * the process is on its way out either way. Checked by dl_should_continue()
+   * and by the verify/repair/extract progress callbacks in download.c so a
+   * long-running PAR2 pass or archive extraction bails out within one
+   * progress tick instead of running to completion, letting main()'s
+   * downloader_stop()/nntp_pool_destroy() join promptly. Plain int, not
+   * mutex-guarded: written once, monotonically 0->1, same pattern as
+   * httpd.c's g_stop. */
+  volatile int     shutdown_requested;
+
   /* Download-speed tracking for GET /api/status: total_bytes is a
    * monotonic counter the downloader adds to; api_status_get() diffs it
    * against this (bytes, time) snapshot, only advancing the snapshot once
@@ -103,6 +113,10 @@ static inline void verify_unlock(void) { pthread_mutex_unlock(&g_app.verify_mu);
 
 static inline void repair_lock(void)   { pthread_mutex_lock(&g_app.repair_mu); }
 static inline void repair_unlock(void) { pthread_mutex_unlock(&g_app.repair_mu); }
+
+/* True once api_system_eject() has requested shutdown -- see
+ * shutdown_requested's comment above. */
+static inline int app_is_shutting_down(void) { return g_app.shutdown_requested; }
 
 /* Called by the downloader as decoded bytes are written to disk. */
 static inline void

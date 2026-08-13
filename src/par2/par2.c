@@ -427,11 +427,12 @@ par2_find_file(const par2_set_t *set, const char *filename) {
   return NULL;
 }
 
-static void
+/* Returns nonzero if the callback asked us to abort. */
+static int
 report_progress(par2_progress_t *pg, size_t n) {
-  if (!pg) return;
+  if (!pg) return 0;
   pg->done += (long long)n;
-  if (pg->cb) pg->cb(pg->cb_ctx, pg->done, pg->total);
+  return pg->cb ? pg->cb(pg->cb_ctx, pg->done, pg->total) : 0;
 }
 
 int
@@ -458,7 +459,12 @@ par2_verify_file(const par2_set_t *set, const par2_file_t *pf, const char *path,
 
   while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
     EVP_DigestUpdate(ctx, buf, n);
-    report_progress(pg, n);
+    if (report_progress(pg, n)) {
+      log_info("par2: verify: aborted mid-read on %s", path);
+      EVP_MD_CTX_free(ctx);
+      fclose(f);
+      return -1;
+    }
   }
   if (ferror(f)) {
     log_warn("par2: verify: read error on %s: %s", path, strerror(errno));
@@ -751,7 +757,7 @@ par2_repair_set(const par2_set_t *set, const par2_repair_file_t *files, size_t f
     }
 
     if (!paths[i]) {
-      snprintf(err, err_size, "PAR2 repair: %s: not part of this job -- recovery set references a file this job doesn't have", pf->name);
+      snprintf(err, err_size, "PAR2 repair: %s: not part of this job - recovery set references a file this job doesn't have", pf->name);
       goto done;
     }
   }
@@ -833,7 +839,7 @@ par2_repair_set(const par2_set_t *set, const par2_repair_file_t *files, size_t f
       have_prev = 1;
       if (s->data_len != set->block_size) continue;
       if (!slice_hash_ok(s)) {
-        log_warn("par2: repair: %s: recovery slice (exponent %u) failed its own integrity hash, skipping -- trying another",
+        log_warn("par2: repair: %s: recovery slice (exponent %u) failed its own integrity hash, skipping - trying another",
                  s->path, s->exponent);
         continue;
       }
@@ -938,9 +944,9 @@ par2_repair_set(const par2_set_t *set, const par2_repair_file_t *files, size_t f
           if (factor) gf16_mul_acc(outbufs[row], inbuf, len, factor);
         }
 
-        if (pg) {
-          pg->done += (long long)len;
-          if (pg->cb) pg->cb(pg->cb_ctx, pg->done, pg->total);
+        if (report_progress(pg, len)) {
+          snprintf(err, err_size, "PAR2 repair: aborted");
+          goto done;
         }
       }
 

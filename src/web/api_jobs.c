@@ -174,7 +174,7 @@ api_jobs_delete(struct MHD_Connection *conn, const char *id) {
 
   if (rc == -2) {
     return json_respond_error(conn, MHD_HTTP_CONFLICT,
-        "job is actively downloading/verifying/repairing/extracting -- cancel it first");
+        "job is actively downloading/verifying/repairing/extracting - cancel it first");
   }
   if (rc < 0) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no such job");
 

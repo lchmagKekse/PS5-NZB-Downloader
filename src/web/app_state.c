@@ -61,7 +61,7 @@ app_reload_pool_if_needed(void) {
   app_build_pool_opts(&snapshot, &opts);
 
   if (!(new_pool = nntp_pool_create(&opts))) {
-    log_error("app_state: failed to rebuild NNTP pool with updated settings -- keeping the previous one");
+    log_error("app_state: failed to rebuild NNTP pool with updated settings - keeping the previous one");
     return;
   }
 

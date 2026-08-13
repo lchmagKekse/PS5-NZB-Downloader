@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 
 #include <microhttpd.h>
@@ -172,6 +173,10 @@ route_post(struct MHD_Connection *conn, const char *url, conn_ctx_t *ctx) {
     return api_config_post(conn, ctx->raw_body, ctx->raw_body_len);
   }
 
+  if (!strcmp(url, "/api/eject")) {
+    return api_system_eject(conn);
+  }
+
   if (!strncmp(url, "/api/jobs/", 10)) {
     char id[64];
     const char *action;
@@ -260,7 +265,6 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url, const char *
 static int
 open_listen_socket(unsigned short port) {
   struct sockaddr_in addr = {0};
-  struct timeval tv = { .tv_sec = 1 };
   int fd;
 
   if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -269,7 +273,6 @@ open_listen_socket(unsigned short port) {
   }
 
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -310,6 +313,20 @@ httpd_stop(void) {
   g_stop = 1;
 }
 
+/* Closes srvfd and blocks (rechecking g_stop once a second) until a fresh
+ * listening socket is bound on port. Returns the new fd, or -1 if g_stop
+ * won the race -- caller must stop the accept loop on -1 without using the
+ * returned fd. */
+static int
+rebuild_listen_socket(int srvfd, unsigned short port) {
+  close(srvfd);
+  srvfd = -1;
+  while (!g_stop && (srvfd = open_listen_socket(port)) < 0) sleep(1);
+  if (g_stop) return -1;
+  log_info("httpd: listening socket rebuilt, resuming on port %u", port);
+  return srvfd;
+}
+
 int
 httpd_listen(unsigned short port) {
   struct MHD_Daemon *httpd;
@@ -336,16 +353,36 @@ httpd_listen(unsigned short port) {
   while (!g_stop) {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof client_addr;
-    int connfd = accept(srvfd, (struct sockaddr *)&client_addr, &addr_len);
+    struct timeval tv = { .tv_sec = 1 };
+    fd_set rfds;
+    int connfd, ready;
 
+    /* select() with a timeout, not a bare blocking accept() -- a listening
+     * socket's accept() isn't guaranteed to honor SO_RCVTIMEO the way a
+     * connected socket's recv() does (confirmed not to on this SDK's
+     * libc), which used to leave httpd_stop() unnoticed until the next
+     * inbound connection happened to wake accept() up -- api_system_eject()
+     * (POST /api/eject) would set g_stop, log it, and then just sit there
+     * still serving requests until someone's browser reconnected. select()'s
+     * timeout is well-defined everywhere, so this recheck of g_stop now
+     * actually fires every ~1s regardless of new traffic. */
+    FD_ZERO(&rfds);
+    FD_SET(srvfd, &rfds);
+
+    ready = select(srvfd + 1, &rfds, NULL, NULL, &tv);
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      log_warn("httpd: select: %s - rebuilding listening socket", strerror(errno));
+      if ((srvfd = rebuild_listen_socket(srvfd, port)) < 0) break;
+      continue;
+    }
+    if (ready == 0) continue; /* 1s elapsed with no pending connection -- recheck g_stop */
+
+    connfd = accept(srvfd, (struct sockaddr *)&client_addr, &addr_len);
     if (connfd < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
       log_warn("httpd: accept: %s - rebuilding listening socket", strerror(errno));
-      close(srvfd);
-      srvfd = -1;
-      while (!g_stop && (srvfd = open_listen_socket(port)) < 0) sleep(1);
-      if (g_stop) break;
-      log_info("httpd: listening socket rebuilt, resuming on port %u", port);
+      if ((srvfd = rebuild_listen_socket(srvfd, port)) < 0) break;
       continue;
     }
 

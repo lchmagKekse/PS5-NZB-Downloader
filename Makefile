@@ -54,6 +54,7 @@ APP_SRCS += src/download/download.c
 APP_SRCS += src/web/app_state.c src/web/asset.c src/web/json_util.c src/web/job_json.c
 APP_SRCS += src/web/httpd.c
 APP_SRCS += src/web/api_status.c src/web/api_jobs.c src/web/api_config.c src/web/api_logs.c
+APP_SRCS += src/web/api_system.c
 
 EXPAT_FLAGS := $(shell $(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config expat --cflags --libs)
 MHD_FLAGS   := $(shell $(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config libmicrohttpd --cflags --libs)

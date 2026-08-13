@@ -247,7 +247,7 @@ queue_remove_job(queue_t *q, const char *id) {
      * checked at the owning thread's own safe points). */
     if (q->jobs[i]->state == JOB_DOWNLOADING || q->jobs[i]->state == JOB_VERIFYING ||
         q->jobs[i]->state == JOB_REPAIRING || q->jobs[i]->state == JOB_EXTRACTING) {
-      log_warn("[%s] queue: remove: job is %s, refusing to delete while active -- cancel it first",
+      log_warn("[%s] queue: remove: job is %s, refusing to delete while active - cancel it first",
                id, job_state_name(q->jobs[i]->state));
       return -2;
     }

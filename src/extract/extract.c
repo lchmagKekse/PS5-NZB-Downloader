@@ -48,11 +48,12 @@ typedef struct {
   void *cb_ctx;
 } progress_t;
 
-static void
+/* Returns nonzero if the callback asked us to abort. */
+static int
 report_progress(progress_t *pg, size_t n) {
-  if (!pg) return;
+  if (!pg) return 0;
   pg->done += (long long)n;
-  if (pg->cb) pg->cb(pg->cb_ctx, pg->done, pg->total);
+  return pg->cb ? pg->cb(pg->cb_ctx, pg->done, pg->total) : 0;
 }
 
 static int
@@ -204,7 +205,10 @@ copy_data(struct archive *ar, struct archive *aw, const char *display_name, cons
       return -1;
     }
 
-    report_progress(pg, size);
+    if (report_progress(pg, size)) {
+      snprintf(err, err_size, "%s: extraction aborted", display_name);
+      return -1;
+    }
   }
 }
 
@@ -302,7 +306,7 @@ extract_one_archive(const char **volumes, const char *dest_dir, const job_t *job
     if (r == ARCHIVE_WARN) {
       log_warn("[%s] extract: %s: %s", job->id, full_path, archive_error_string(ext));
     } else if (r != ARCHIVE_OK) {
-      log_warn("[%s] extract: %s: %s -- skipping this entry", job->id, full_path, archive_error_string(ext));
+      log_warn("[%s] extract: %s: %s - skipping this entry", job->id, full_path, archive_error_string(ext));
       continue;
     }
 
@@ -562,7 +566,7 @@ size_group_fn(const char *dir, const char **paths, size_t gcount, void *ctx_) {
     return;
   }
 
-  log_warn("[%s] extract: nested scan: could not read %s to size it (starting %s) -- "
+  log_warn("[%s] extract: nested scan: could not read %s to size it (starting %s) - "
            "falling back to on-disk size for this set", ctx->job->id, dir, paths[0]);
   {
     size_t pi;

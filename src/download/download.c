@@ -199,13 +199,16 @@ dl_state_wait(job_dl_state_t *st) {
   pthread_mutex_unlock(&st->mu);
 }
 
-/* True as long as the job is still meant to be actively working --
- * false once an API handler has paused/cancelled it out from under us.
- * Reads job->state under queue_lock since API handler threads write it
- * concurrently. */
+/* True as long as the job is still meant to be actively working -- false
+ * once an API handler has paused/cancelled it out from under us, or the
+ * whole payload is shutting down (api_system_eject(), see app_state.h's
+ * shutdown_requested). Reads job->state under queue_lock since API handler
+ * threads write it concurrently. */
 static int
 dl_should_continue(const job_t *job) {
   int cont;
+
+  if (app_is_shutting_down()) return 0;
 
   queue_lock();
   cont = (job->state != JOB_PAUSED && job->state != JOB_CANCELLED);
@@ -442,7 +445,7 @@ segment_done_cb(void *ctx, int status) {
     log_warn("[%s] download: segment %s: no valid yEnc framing found in the article body",
               sc->job->id, sc->seg->message_id);
   } else if (sc->have_expected_crc && crc32_final(sc->crc) != (unsigned long)sc->expected_crc) {
-    log_warn("[%s] download: segment %s: yEnc CRC32 mismatch (got %08lx, expected %08lx) -- corrupt article",
+    log_warn("[%s] download: segment %s: yEnc CRC32 mismatch (got %08lx, expected %08lx) - corrupt article",
               sc->job->id, sc->seg->message_id, crc32_final(sc->crc), (unsigned long)sc->expected_crc);
   } else {
     ok = 1;
@@ -618,14 +621,18 @@ check_server_reachable(char *err, size_t err_size) {
 
 /* par2_progress_cb for par2_verify_job() -- updates g_app's verify-progress
  * fields (app_state.h) so GET /api/jobs can report a percentage. Called
- * once per read() chunk, so just a locked field update, no I/O. */
-static void
+ * once per read() chunk, so just a locked field update, no I/O. Returns
+ * nonzero once shutdown_requested is set, telling par2_verify_file() to
+ * abort within one chunk instead of verifying the rest of a possibly huge
+ * file. */
+static int
 verify_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
   (void)ctx;
   verify_lock();
   g_app.verify_bytes_done = bytes_done;
   g_app.verify_bytes_total = bytes_total;
   verify_unlock();
+  return app_is_shutting_down();
 }
 
 /* Runs PAR2 verification (../par2/par2.h) over every downloaded file the
@@ -730,14 +737,16 @@ par2_verify_job(job_t *job, char *err, size_t err_size) {
 }
 
 /* par2_progress_cb for par2_repair_job()'s par2_repair_set() call --
- * mirrors verify_progress_update()/extract_progress_update() exactly. */
-static void
+ * mirrors verify_progress_update()/extract_progress_update() exactly,
+ * including the shutdown-abort return. */
+static int
 repair_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
   (void)ctx;
   repair_lock();
   g_app.repair_bytes_done = bytes_done;
   g_app.repair_bytes_total = bytes_total;
   repair_unlock();
+  return app_is_shutting_down();
 }
 
 /* Attempts full PAR2 repair (Reed-Solomon over GF(2^16), see
@@ -887,14 +896,17 @@ move_file(const char *src, const char *dst) {
 /* extract_progress_cb for finalize_job()'s extract_job() call -- updates
  * g_app's extraction-progress fields (app_state.h) so GET /api/jobs can
  * report a percentage. Called once per libarchive block, so just a
- * locked field update, no I/O. */
-static void
+ * locked field update, no I/O. Returns nonzero once shutdown_requested is
+ * set, telling extract_job() to abort within one block instead of running
+ * a possibly multi-GB extraction to completion. */
+static int
 extract_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
   (void)ctx;
   extract_lock();
   g_app.extract_bytes_done = bytes_done;
   g_app.extract_bytes_total = bytes_total;
   extract_unlock();
+  return app_is_shutting_down();
 }
 
 /* True if name is a PAR2/archive sidecar file -- never the actual
@@ -1029,12 +1041,12 @@ job_fail_or_retry(job_t *job, const char *err) {
 
   if (job->retries_used < max_retries) {
     job->retries_used++;
-    log_warn("[%s] download (%s): %s -- auto-retrying (%d/%d)",
+    log_warn("[%s] download (%s): %s - auto-retrying (%d/%d)",
              job->id, job->name, err, job->retries_used, max_retries);
     job_set_state(job, JOB_QUEUED);
   } else {
     if (max_retries > 0) {
-      log_error("[%s] download (%s): %s -- giving up after %d retr%s",
+      log_error("[%s] download (%s): %s - giving up after %d retr%s",
                 job->id, job->name, err, max_retries, max_retries == 1 ? "y" : "ies");
     }
     job_set_state(job, JOB_FAILED);
@@ -1042,6 +1054,24 @@ job_fail_or_retry(job_t *job, const char *err) {
 
   queue_save_job(g_app.queue, job);
   queue_unlock();
+}
+
+/* Used wherever a verify/repair/extract step failed only because
+ * api_system_eject() asked everything to stop (see app_state.h's
+ * shutdown_requested) -- forces the job to a clean JOB_CANCELLED rather
+ * than the JOB_FAILED a real verify/repair/extract error would get, since
+ * par2_verify_job()/par2_repair_job()/finalize_job() overwrite job->state
+ * to JOB_VERIFYING/JOB_REPAIRING/JOB_EXTRACTING right as they start,
+ * clobbering whatever state api_system_eject() set before the abort was
+ * even noticed. Leaves the job retryable (queue_retry_job() accepts
+ * JOB_CANCELLED) instead of stuck showing a misleading "aborted" error. */
+static void
+job_mark_stopped(job_t *job) {
+  queue_lock();
+  job_set_state(job, JOB_CANCELLED);
+  queue_save_job(g_app.queue, job);
+  queue_unlock();
+  log_info("[%s] download: stopped (payload is shutting down)", job->id);
 }
 
 static void
@@ -1052,7 +1082,7 @@ download_job(finalize_queue_t *fq, job_t *job) {
   char reach_err[256];
 
   if (check_server_reachable(reach_err, sizeof reach_err) < 0) {
-    log_error("[%s] download: %s -- not attempting any segments", job->id, reach_err);
+    log_error("[%s] download: %s - not attempting any segments", job->id, reach_err);
     job_fail_or_retry(job, reach_err);
     return;
   }
@@ -1065,7 +1095,7 @@ download_job(finalize_queue_t *fq, job_t *job) {
     needed = job_remaining_bytes(job);
     free_bytes = path_free_bytes(temp_dir);
 
-    log_info("[%s] download (%s): starting -- %zu file(s), %lld bytes remaining",
+    log_info("[%s] download (%s): starting - %zu file(s), %lld bytes remaining",
              job->id, job->name, job->file_count, needed);
     log_info("[%s] download: space check on temp dir %s: %lld bytes needed, %lld available",
              job->id, temp_dir, needed, free_bytes);
@@ -1144,7 +1174,7 @@ download_job(finalize_queue_t *fq, job_t *job) {
     if (!all_ok) {
       char msg[300];
 
-      log_error("[%s] download (%s): failed -- %s", job->id, job->name, detail);
+      log_error("[%s] download (%s): failed - %s", job->id, job->name, detail);
       snprintf(msg, sizeof msg, "one or more files incomplete: %s", detail);
       job_fail_or_retry(job, msg);
       return;
@@ -1157,10 +1187,13 @@ download_job(finalize_queue_t *fq, job_t *job) {
     if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
       char repair_err[256];
 
-      log_warn("[%s] download (%s): PAR2 verify failed (%s) -- attempting repair",
+      if (app_is_shutting_down()) { job_mark_stopped(job); return; }
+
+      log_warn("[%s] download (%s): PAR2 verify failed (%s) - attempting repair",
                job->id, job->name, verify_err);
 
       if (!par2_repair_job(job, repair_err, sizeof repair_err)) {
+        if (app_is_shutting_down()) { job_mark_stopped(job); return; }
         log_error("[%s] download (%s): %s", job->id, job->name, repair_err);
         queue_lock();
         snprintf(job->last_error, sizeof job->last_error, "%s", repair_err);
@@ -1174,7 +1207,8 @@ download_job(finalize_queue_t *fq, job_t *job) {
        * and disk writes went through without a fatal error -- the real
        * confirmation is re-running verify and having it actually pass. */
       if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
-        log_error("[%s] download (%s): repair completed but re-verification still failed -- %s",
+        if (app_is_shutting_down()) { job_mark_stopped(job); return; }
+        log_error("[%s] download (%s): repair completed but re-verification still failed - %s",
                    job->id, job->name, verify_err);
         queue_lock();
         snprintf(job->last_error, sizeof job->last_error,
@@ -1219,6 +1253,7 @@ finalizer_main(void *arg) {
     }
 
     if (!finalize_job(job, finalize_err, sizeof finalize_err)) {
+      if (app_is_shutting_down()) { job_mark_stopped(job); continue; }
       log_error("[%s] download (%s): %s", job->id, job->name, finalize_err);
       queue_lock();
       snprintf(job->last_error, sizeof job->last_error, "%s", finalize_err);

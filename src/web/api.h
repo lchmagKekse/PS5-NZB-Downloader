@@ -30,3 +30,7 @@ enum MHD_Result api_logs_get(struct MHD_Connection *conn);
 /* Streams the full on-disk logfile as a download, unlike api_logs_get()'s
  * ring buffer of just the last LOG_RING_CAPACITY lines. */
 enum MHD_Result api_logs_download(struct MHD_Connection *conn);
+
+/* Cleanly stops the httpd loop so the payload returns control to whatever
+ * loaded it, without rebooting the console -- see api_system.c. */
+enum MHD_Result api_system_eject(struct MHD_Connection *conn);

@@ -39,7 +39,7 @@
         <div class="field"><label>Simultaneous connections</label><input type="number" min="1" max="50" name="nntp.max_connections" required></div>
         <div class="field"><label>Auto-retry attempts</label><input type="number" min="0" max="20" name="queue.max_retries" required></div>
       </div>
-      <p class="muted" style="margin-top:10px;">Connection settings apply immediately if nothing is downloading, otherwise as soon as the current download finishes.</p>
+      <p class="muted" style="margin-top:10px; margin-bottom:0px;">Connection settings apply immediately if nothing is downloading, otherwise as soon as the current download finishes.</p>
     </article>
 
     <article>
@@ -48,7 +48,7 @@
         <div class="field"><label>Output directory</label><input type="text" name="storage.output_dir" required></div>
         <div class="field"><label>Temp directory</label><input type="text" name="storage.temp_dir" required></div>
       </div>
-      <p class="muted" style="margin-top:10px;">Each job downloads into its own subdirectory under temp directory. Once complete, files are moved/extracted into output directory</p>
+      <p class="muted" style="margin-top:10px; margin-bottom:0px;">Each job downloads into its own subdirectory under temp directory. Once complete, files are moved/extracted into output directory</p>
     </article>
 
     <p>
@@ -58,13 +58,25 @@
   </form>
 
   <article>
-    <h3 style="margin-top:0;">About</h3>
-    <p>
-      <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-code-branch"></i> Source Code</a>
-      <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader/issues/new" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-bug"></i> Report a bug</a>
-    </p>
+    <h3 style="margin-top:0;">Miscellaneous</h3>
+    <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-code-branch"></i> Source Code</a>
+    <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader/issues/new" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-bug"></i> Report a bug</a>
+    <button type="button" id="eject-btn" class="danger"><i class="fa-solid fa-eject"></i> Eject</button>
   </article>
 </main>
+
+<dialog id="confirm-modal">
+  <article>
+    <header>
+      <strong id="confirm-modal-title">Confirm</strong>
+    </header>
+    <p id="confirm-modal-message"></p>
+    <footer>
+      <button type="button" class="secondary" data-modal-cancel>Cancel</button>
+      <button type="button" id="confirm-modal-confirm">Confirm</button>
+    </footer>
+  </article>
+</dialog>
 
 <script src="/main.js"></script>
 <script>
@@ -127,6 +139,17 @@ form.addEventListener('submit', async (e) => {
 
 load().catch(e => {
   document.getElementById('save-status').textContent = 'Failed to load: ' + e.message;
+});
+
+document.getElementById('eject-btn').addEventListener('click', async () => {
+  const status = document.getElementById('eject-status');
+
+  const ok = await confirmModal('Are you sure you want to eject the payload?', {
+    title: 'Eject payload', confirmLabel: 'Eject', danger: true,
+  });
+  if (!ok) return;
+  
+  await apiPost('/api/eject', {});
 });
 </script>
 </body>
