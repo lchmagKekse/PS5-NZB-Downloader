@@ -1069,6 +1069,8 @@ download_job(finalize_queue_t *fq, job_t *job) {
 
     log_info("[%s] download (%s): starting -- %zu file(s), %lld bytes remaining",
              job->id, job->name, job->file_count, needed);
+    log_info("[%s] download: space check on temp dir %s: %lld bytes needed, %lld available",
+             job->id, temp_dir, needed, free_bytes);
     notify("Downloading: %s", job->name);
 
     /* free_bytes < 0 means the check itself failed (e.g. statfs error) --

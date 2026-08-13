@@ -576,12 +576,17 @@ size_group_fn(const char *dir, const char **paths, size_t gcount, void *ctx_) {
 typedef struct {
   const job_t *job;
   progress_t  *pg;
+  int failed;         /* set on the first group that fails to extract */
+  char err[256];       /* reason for the first failure, valid iff failed */
 } nested_extract_ctx_t;
 
 /* Extraction callback: extracts this group in place into dir and removes
  * the now-redundant volume files on success. A failure (e.g. unmatched
- * password) just logs and leaves the volumes in place -- doesn't fail
- * the job. */
+ * password, disk full mid-write) logs and leaves the volumes in place
+ * (for inspection or a manual retry), and records the failure on ctx so
+ * extract_job() fails the whole job instead of reporting success with
+ * incomplete output. Later groups still run so every failure gets
+ * logged, but only the first is reported as the job's error. */
 static void
 extract_group_fn(const char *dir, const char **paths, size_t gcount, void *ctx_) {
   nested_extract_ctx_t *ctx = ctx_;
@@ -600,6 +605,10 @@ extract_group_fn(const char *dir, const char **paths, size_t gcount, void *ctx_)
     }
   } else {
     log_warn("[%s] extract: nested archive inside %s failed: %s", ctx->job->id, dir, nested_err);
+    if (!ctx->failed) {
+      ctx->failed = 1;
+      snprintf(ctx->err, sizeof ctx->err, "nested archive inside %s failed: %s", dir, nested_err);
+    }
   }
 }
 
@@ -640,19 +649,6 @@ extract_job(const job_t *job, const char *src_dir, const char *dest_dir,
     snprintf(members[member_count].filename, sizeof members[member_count].filename,
              "%s", job->files[fi].filename);
     member_count++;
-  }
-
-  /* On-disk source size, not true decompressed size -- known upfront and
-   * good enough for a progress bar. See extract_progress_cb in extract.h. */
-  for (fi = 0; fi < member_count; fi++) {
-    char safe_name[512], path[900];
-    struct stat st;
-
-    snprintf(safe_name, sizeof safe_name, "%s", members[fi].filename);
-    path_sanitize_component(safe_name, sizeof safe_name);
-    snprintf(path, sizeof path, "%s/%s", src_dir, safe_name);
-
-    if (stat(path, &st) == 0) pg.total += (long long)st.st_size;
   }
 
   for (fi = 0; fi < member_count; fi++) {
@@ -706,6 +702,37 @@ extract_job(const job_t *job, const char *src_dir, const char *dest_dir,
       paths[pi] = path;
     }
 
+    /* Real decompressed size of this set (headers, not on-disk volume
+     * size) -- same basis nested extraction uses, so bytes_done never
+     * outruns bytes_total, and a good-faith free-space check below. */
+    {
+      long long group_bytes = peek_archive_total_bytes(paths, job);
+      long long free_bytes;
+
+      if (group_bytes < 0) {
+        struct stat st;
+        group_bytes = 0;
+        for (pi = 0; pi < gcount; pi++) {
+          if (stat(paths[pi], &st) == 0) group_bytes += (long long)st.st_size;
+        }
+      }
+      pg.total += group_bytes;
+      if (pg.cb) pg.cb(pg.cb_ctx, pg.done, pg.total);
+
+      free_bytes = path_free_bytes(dest_dir);
+      log_info("[%s] extract: space check on output dir %s: %lld bytes needed, %lld available",
+               job->id, dest_dir, group_bytes, free_bytes);
+      if (free_bytes >= 0 && free_bytes < group_bytes) {
+        snprintf(err, err_size,
+                 "insufficient disk space to extract %s: %lld bytes needed, %lld available",
+                 group_buf[0].filename, group_bytes, free_bytes);
+        for (pi = 0; pi < gcount; pi++) free((void *)paths[pi]);
+        free(paths);
+        result = EXTRACT_FAILED;
+        goto done;
+      }
+    }
+
     log_info("[%s] extract: extracting %zu volume(s) starting with %s -> %s",
              job->id, gcount, group_buf[0].filename, dest_dir);
 
@@ -727,25 +754,48 @@ extract_job(const job_t *job, const char *src_dir, const char *dest_dir,
    * headers (on-disk size would undercount a genuinely compressed nested
    * archive), then extract_group_fn runs the real extraction against a
    * fresh progress_t -- deliberately restarting the progress bar at 0% for
-   * this second, separate unpacking step. */
+   * this second, separate unpacking step. A failure in that second walk
+   * (including running out of space) fails the whole job -- see
+   * nested_extract_ctx_t. */
   if (found_any) {
     nested_size_ctx_t size_ctx = { job, 0 };
 
     walk_nested_archives(dest_dir, NESTED_EXTRACT_MAX_DEPTH, job->id, size_group_fn, &size_ctx);
 
     if (size_ctx.total > 0) {
-      progress_t nested_pg = {0};
-      nested_extract_ctx_t extract_ctx;
+      long long free_bytes = path_free_bytes(dest_dir);
 
-      nested_pg.total = size_ctx.total;
-      nested_pg.cb = pg.cb;
-      nested_pg.cb_ctx = pg.cb_ctx;
+      log_info("[%s] extract: space check on output dir %s for nested archive: %lld bytes needed, %lld available",
+               job->id, dest_dir, size_ctx.total, free_bytes);
 
-      if (nested_pg.cb) nested_pg.cb(nested_pg.cb_ctx, 0, nested_pg.total);
+      if (free_bytes >= 0 && free_bytes < size_ctx.total) {
+        snprintf(err, err_size,
+                 "insufficient disk space to extract nested archive: %lld bytes needed, %lld available",
+                 size_ctx.total, free_bytes);
+        result = EXTRACT_FAILED;
+        goto done;
+      }
 
-      extract_ctx.job = job;
-      extract_ctx.pg = &nested_pg;
-      walk_nested_archives(dest_dir, NESTED_EXTRACT_MAX_DEPTH, job->id, extract_group_fn, &extract_ctx);
+      {
+        progress_t nested_pg = {0};
+        nested_extract_ctx_t extract_ctx = {0};
+
+        nested_pg.total = size_ctx.total;
+        nested_pg.cb = pg.cb;
+        nested_pg.cb_ctx = pg.cb_ctx;
+
+        if (nested_pg.cb) nested_pg.cb(nested_pg.cb_ctx, 0, nested_pg.total);
+
+        extract_ctx.job = job;
+        extract_ctx.pg = &nested_pg;
+        walk_nested_archives(dest_dir, NESTED_EXTRACT_MAX_DEPTH, job->id, extract_group_fn, &extract_ctx);
+
+        if (extract_ctx.failed) {
+          snprintf(err, err_size, "%s", extract_ctx.err);
+          result = EXTRACT_FAILED;
+          goto done;
+        }
+      }
     }
   }
 

@@ -6,8 +6,15 @@
  *
  * Also handles rar-within-rar (scene release layout): after extracting,
  * dest_dir is rescanned recursively for another archive set, extracted
- * in place with its volume files removed; failures there are logged,
- * not fatal.
+ * in place with its volume files removed on success. A failure there
+ * (bad password, corrupt data, disk full mid-write) fails the whole job
+ * (EXTRACT_FAILED) -- the volume files are left in place either way, for
+ * inspection or a manual retry.
+ *
+ * Before extracting any archive set (outer or nested), the destination
+ * filesystem's free space is checked against that set's real
+ * (decompressed) size; insufficient space fails the job up front instead
+ * of failing partway through a write.
  */
 #pragma once
 
@@ -23,9 +30,9 @@ typedef enum {
 
 /* Progress callback invoked as bytes are written during extract_job() --
  * may fire once per libarchive read/write block, so keep it cheap.
- * bytes_done is cumulative across all archive sets; bytes_total is an
- * approximation (sum of source volume sizes, not decompressed output).
- * May be NULL. */
+ * bytes_done is cumulative across all archive sets; bytes_total is the
+ * real decompressed size (read from archive headers, same basis as
+ * bytes_done) so done never exceeds total. May be NULL. */
 typedef void (*extract_progress_cb)(void *ctx, long long bytes_done, long long bytes_total);
 
 /* Scans job's files in src_dir for the starting volume of an archive
