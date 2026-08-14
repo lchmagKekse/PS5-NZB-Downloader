@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../download/download.h"
 #include "../log/log.h"
 #include "../nntp/nntp_pool.h"
 #include "../nzb/nzb_parse.h"
@@ -161,7 +162,8 @@ enum MHD_Result api_jobs_retry(struct MHD_Connection *conn, const char *id)  { r
 
 enum MHD_Result
 api_jobs_delete(struct MHD_Connection *conn, const char *id) {
-  char temp_dir[700];
+  char temp_dir[700], dest_dir[900] = {0};
+  job_t *job;
   int rc;
 
   config_lock();
@@ -169,6 +171,10 @@ api_jobs_delete(struct MHD_Connection *conn, const char *id) {
   config_unlock();
 
   queue_lock();
+
+  if ((job = queue_find_job(g_app.queue, id)) && job->state != JOB_COMPLETED) {
+    job_output_dest_dir(job, dest_dir, sizeof dest_dir);
+  }
   rc = queue_remove_job(g_app.queue, id);
   queue_unlock();
 
@@ -181,6 +187,8 @@ api_jobs_delete(struct MHD_Connection *conn, const char *id) {
   /* Best-effort: the job record is gone either way, so a cleanup
    * failure here is logged, not surfaced as a DELETE failure. */
   rmdir_recursive(temp_dir);
+
+  if (dest_dir[0]) rmdir_recursive(dest_dir);
 
   return json_respond(conn, MHD_HTTP_OK, cJSON_CreateObject());
 }

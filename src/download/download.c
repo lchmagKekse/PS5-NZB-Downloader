@@ -881,6 +881,34 @@ job_output_subdir(const job_t *job, char *out, size_t out_size) {
   snprintf(out, out_size, "%s", name);
 }
 
+/* storage.output_dir (or job->output_dir, if the job set a per-job
+ * override -- see job.h) joined with job_output_subdir() -- the exact
+ * directory finalize_job() extracts/moves a job's real output into,
+ * computed identically wherever it's needed (here, and
+ * api_jobs_delete()'s cleanup of an incomplete job's partial output) so
+ * they can't drift apart. out[0] is left 0 if no output_dir is configured
+ * at all (job->output_dir empty and storage.output_dir unset) --
+ * finalize_job() leaves files under temp_dir in that case, so there's
+ * never a separate output directory to clean up. */
+void
+job_output_dest_dir(const job_t *job, char *out, size_t out_size) {
+  char subdir[300], output_dir[512];
+
+  job_output_subdir(job, subdir, sizeof subdir);
+
+  if (job->output_dir[0]) {
+    snprintf(output_dir, sizeof output_dir, "%s", job->output_dir);
+  } else {
+    config_lock();
+    snprintf(output_dir, sizeof output_dir, "%s", g_app.config.storage.output_dir);
+    config_unlock();
+  }
+
+  if (!output_dir[0]) { out[0] = 0; return; }
+
+  snprintf(out, out_size, "%s/%s", output_dir, subdir);
+}
+
 /* Moves src to dst: rename() first, falling back to copy+delete on EXDEV
  * (temp_dir/output_dir on different filesystems -- plausible with
  * multiple mounted USB drives). chmod's dst 0777 since files may arrive
@@ -984,26 +1012,13 @@ is_sidecar_file(const char *name) {
  * or its files inspected. */
 static int
 finalize_job(job_t *job, char *err, size_t err_size) {
-  char temp_dir[700], subdir[300], output_dir[512], dest_dir[900];
+  char temp_dir[700], dest_dir[900];
   extract_result_t res;
 
   job_temp_dir(job, temp_dir, sizeof temp_dir);
-  job_output_subdir(job, subdir, sizeof subdir);
+  job_output_dest_dir(job, dest_dir, sizeof dest_dir);
 
-  /* job->output_dir (add-NZB modal's "Output folder", editable per job --
-   * see job.h) takes priority over the globally configured
-   * storage.output_dir, if the job set one. */
-  if (job->output_dir[0]) {
-    snprintf(output_dir, sizeof output_dir, "%s", job->output_dir);
-  } else {
-    config_lock();
-    snprintf(output_dir, sizeof output_dir, "%s", g_app.config.storage.output_dir);
-    config_unlock();
-  }
-
-  if (!output_dir[0]) return 1; /* nothing configured to do -- leave files in temp_dir */
-
-  snprintf(dest_dir, sizeof dest_dir, "%s/%s", output_dir, subdir);
+  if (!dest_dir[0]) return 1; /* nothing configured to do -- leave files in temp_dir */
 
   queue_lock();
   job_set_state(job, JOB_EXTRACTING);

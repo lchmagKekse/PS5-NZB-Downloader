@@ -11,6 +11,10 @@
  */
 #pragma once
 
+#include <stddef.h>
+
+#include "../queue/job.h"
+
 typedef struct downloader downloader_t;
 
 /* Spawns both orchestrator threads (download, and extract/finalize).
@@ -23,3 +27,11 @@ downloader_t *downloader_start(void);
  * extracting whatever is already queued -- a shutdown never abandons a
  * job mid-extraction. Joins both threads and frees d. Safe with d == NULL. */
 void downloader_stop(downloader_t *d);
+
+/* Computes the directory finalize_job() extracts/moves a job's real output
+ * into (storage.output_dir or job->output_dir, plus a sanitized subdir
+ * derived from job->name) -- exposed so api_jobs_delete() can clean up an
+ * incomplete job's partial output the same way finalize_job() would have
+ * placed it. out[0] is left 0 if no output_dir is configured at all (see
+ * download.c's job_output_dest_dir() for the exact rule). */
+void job_output_dest_dir(const job_t *job, char *out, size_t out_size);
