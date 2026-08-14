@@ -139,12 +139,16 @@ function progressBarHtml(job) {
   `;
 }
 
-/* Mirrors queue_remove_job()'s own guard (src/queue/queue.c) -- a job in
- * one of these states is a raw pointer the downloader/finalizer threads
- * are actively working on unlocked, so DELETE /api/jobs/:id refuses it
- * (409). Keeping the Remove button hidden for exactly this set, rather
- * than showing it and surfacing that rejection as an alert(), is just UI
- * politeness -- the backend is what actually enforces this. */
+/* Mirrors most of queue_remove_job()'s own guard (src/queue/queue.c) -- a
+ * job in one of these states is a raw pointer the downloader/finalizer
+ * threads are actively working on unlocked, so DELETE /api/jobs/:id
+ * refuses it (409). Keeping the Remove button hidden for exactly this set,
+ * rather than showing it and surfacing that rejection as an alert(), is
+ * just UI politeness -- the backend is what actually enforces this.
+ * (The backend guard also covers a brief post-Cancel window, while a
+ * verify/repair/extract call notices and unwinds, that isn't visible in
+ * job.state and so isn't reflected here -- Remove during that window
+ * still just surfaces the backend's 409 as an alert().) */
 const JOB_ACTIVE_STATES = ['downloading', 'verifying', 'repairing', 'extracting'];
 
 function jobActionButtons(job) {

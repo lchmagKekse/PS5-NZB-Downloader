@@ -241,14 +241,19 @@ queue_remove_job(queue_t *q, const char *id) {
   for (i = 0; i < q->count; i++) {
     if (strcmp(q->jobs[i]->id, id)) continue;
 
-    /* A job in one of these states may be a raw pointer download.c's worker/
-     * finalizer threads are using unlocked, so freeing it now would be a
-     * use-after-free. Cancelling first is safe (just flips job->state,
-     * checked at the owning thread's own safe points). */
+    /* A job in one of these states, or with busy set, may be a raw pointer
+     * download.c's worker/finalizer threads are still dereferencing, so
+     * freeing it now would be a use-after-free. busy covers the gap state
+     * alone can't: Cancel flips state to JOB_CANCELLED immediately, but a
+     * worker thread blocked inside PAR2 verify/repair or archive extraction
+     * only notices at its next progress-callback tick and needs a moment to
+     * unwind -- see job.h's busy comment and download.c's
+     * job_busy_begin()/job_busy_end(). */
     if (q->jobs[i]->state == JOB_DOWNLOADING || q->jobs[i]->state == JOB_VERIFYING ||
-        q->jobs[i]->state == JOB_REPAIRING || q->jobs[i]->state == JOB_EXTRACTING) {
-      log_warn("[%s] queue: remove: job is %s, refusing to delete while active - cancel it first",
-               id, job_state_name(q->jobs[i]->state));
+        q->jobs[i]->state == JOB_REPAIRING || q->jobs[i]->state == JOB_EXTRACTING ||
+        q->jobs[i]->busy) {
+      log_warn("[%s] queue: remove: job is %s%s, refusing to delete while active - try again shortly",
+               id, job_state_name(q->jobs[i]->state), q->jobs[i]->busy ? " (still finishing up)" : "");
       return -2;
     }
 

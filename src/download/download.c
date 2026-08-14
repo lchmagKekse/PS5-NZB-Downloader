@@ -217,6 +217,44 @@ dl_should_continue(const job_t *job) {
   return cont;
 }
 
+/* True if an API handler has cancelled this job. Unlike dl_should_continue()
+ * (checked between segments/files, where dispatch just stops), this is
+ * checked from inside verify_progress_update()/repair_progress_update()/
+ * extract_progress_update() -- the only safe point during a single blocking
+ * par2_verify_job()/par2_repair_job()/extract_job() call to notice a Cancel
+ * and abort within one chunk instead of running the whole pass to
+ * completion regardless. */
+static int
+job_was_cancelled(const job_t *job) {
+  int cancelled;
+
+  queue_lock();
+  cancelled = (job->state == JOB_CANCELLED);
+  queue_unlock();
+
+  return cancelled;
+}
+
+/* Brackets a blocking par2_verify_job()/par2_repair_job()/finalize_job()
+ * call so queue_remove_job() can tell a job that merely *says*
+ * JOB_CANCELLED (state flips the instant the API handler runs) from one
+ * this thread is still actually dereferencing -- see job.h's busy comment.
+ * Must be paired: job_busy_end() before every exit out of the bracketed
+ * call, including early returns. */
+static void
+job_busy_begin(job_t *job) {
+  queue_lock();
+  job->busy = 1;
+  queue_unlock();
+}
+
+static void
+job_busy_end(job_t *job) {
+  queue_lock();
+  job->busy = 0;
+  queue_unlock();
+}
+
 /* storage.temp_dir/<job id>/, computed the same way everywhere it's
  * needed so they can't drift. */
 static void
@@ -622,17 +660,19 @@ check_server_reachable(char *err, size_t err_size) {
 /* par2_progress_cb for par2_verify_job() -- updates g_app's verify-progress
  * fields (app_state.h) so GET /api/jobs can report a percentage. Called
  * once per read() chunk, so just a locked field update, no I/O. Returns
- * nonzero once shutdown_requested is set, telling par2_verify_file() to
- * abort within one chunk instead of verifying the rest of a possibly huge
- * file. */
+ * nonzero once shutdown_requested is set, or the job itself gets
+ * cancelled, telling par2_verify_file() to abort within one chunk instead
+ * of verifying the rest of a possibly huge file. ctx is the job_t* (see
+ * par2_verify_job()'s pg.cb_ctx). */
 static int
 verify_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
-  (void)ctx;
+  const job_t *job = ctx;
+
   verify_lock();
   g_app.verify_bytes_done = bytes_done;
   g_app.verify_bytes_total = bytes_total;
   verify_unlock();
-  return app_is_shutting_down();
+  return app_is_shutting_down() || job_was_cancelled(job);
 }
 
 /* Runs PAR2 verification (../par2/par2.h) over every downloaded file the
@@ -676,6 +716,7 @@ par2_verify_job(job_t *job, char *err, size_t err_size) {
   }
 
   pg.cb = verify_progress_update;
+  pg.cb_ctx = job;
   verify_lock();
   snprintf(g_app.verify_job_id, sizeof g_app.verify_job_id, "%s", job->id);
   g_app.verify_bytes_done = 0;
@@ -738,15 +779,16 @@ par2_verify_job(job_t *job, char *err, size_t err_size) {
 
 /* par2_progress_cb for par2_repair_job()'s par2_repair_set() call --
  * mirrors verify_progress_update()/extract_progress_update() exactly,
- * including the shutdown-abort return. */
+ * including the shutdown/cancel-abort return. ctx is the job_t*. */
 static int
 repair_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
-  (void)ctx;
+  const job_t *job = ctx;
+
   repair_lock();
   g_app.repair_bytes_done = bytes_done;
   g_app.repair_bytes_total = bytes_total;
   repair_unlock();
-  return app_is_shutting_down();
+  return app_is_shutting_down() || job_was_cancelled(job);
 }
 
 /* Attempts full PAR2 repair (Reed-Solomon over GF(2^16), see
@@ -803,6 +845,7 @@ par2_repair_job(job_t *job, char *err, size_t err_size) {
   }
 
   pg.cb = repair_progress_update;
+  pg.cb_ctx = job;
   repair_lock();
   snprintf(g_app.repair_job_id, sizeof g_app.repair_job_id, "%s", job->id);
   g_app.repair_bytes_done = 0;
@@ -897,16 +940,18 @@ move_file(const char *src, const char *dst) {
  * g_app's extraction-progress fields (app_state.h) so GET /api/jobs can
  * report a percentage. Called once per libarchive block, so just a
  * locked field update, no I/O. Returns nonzero once shutdown_requested is
- * set, telling extract_job() to abort within one block instead of running
- * a possibly multi-GB extraction to completion. */
+ * set, or the job itself gets cancelled, telling extract_job() to abort
+ * within one block instead of running a possibly multi-GB extraction to
+ * completion. ctx is the job_t* (see finalize_job()'s extract_job() call). */
 static int
 extract_progress_update(void *ctx, long long bytes_done, long long bytes_total) {
-  (void)ctx;
+  const job_t *job = ctx;
+
   extract_lock();
   g_app.extract_bytes_done = bytes_done;
   g_app.extract_bytes_total = bytes_total;
   extract_unlock();
-  return app_is_shutting_down();
+  return app_is_shutting_down() || job_was_cancelled(job);
 }
 
 /* True if name is a PAR2/archive sidecar file -- never the actual
@@ -971,7 +1016,7 @@ finalize_job(job_t *job, char *err, size_t err_size) {
   g_app.extract_bytes_total = 0;
   extract_unlock();
 
-  res = extract_job(job, temp_dir, dest_dir, extract_progress_update, NULL, err, err_size);
+  res = extract_job(job, temp_dir, dest_dir, extract_progress_update, job, err, err_size);
 
   extract_lock();
   g_app.extract_job_id[0] = 0;
@@ -1057,21 +1102,25 @@ job_fail_or_retry(job_t *job, const char *err) {
 }
 
 /* Used wherever a verify/repair/extract step failed only because
- * api_system_eject() asked everything to stop (see app_state.h's
- * shutdown_requested) -- forces the job to a clean JOB_CANCELLED rather
- * than the JOB_FAILED a real verify/repair/extract error would get, since
- * par2_verify_job()/par2_repair_job()/finalize_job() overwrite job->state
- * to JOB_VERIFYING/JOB_REPAIRING/JOB_EXTRACTING right as they start,
- * clobbering whatever state api_system_eject() set before the abort was
- * even noticed. Leaves the job retryable (queue_retry_job() accepts
- * JOB_CANCELLED) instead of stuck showing a misleading "aborted" error. */
+ * api_system_eject() asked everything to stop, or an API handler cancelled
+ * this job mid-step (see verify_progress_update()/repair_progress_update()/
+ * extract_progress_update()) -- forces the job to a clean JOB_CANCELLED
+ * rather than the JOB_FAILED a real verify/repair/extract error would get,
+ * since par2_verify_job()/par2_repair_job()/finalize_job() overwrite
+ * job->state to JOB_VERIFYING/JOB_REPAIRING/JOB_EXTRACTING right as they
+ * start, clobbering whatever state was set before the abort was even
+ * noticed (including a user Cancel that raced with that overwrite). Leaves
+ * the job retryable (queue_retry_job() accepts JOB_CANCELLED) instead of
+ * stuck showing a misleading "aborted" error. */
 static void
 job_mark_stopped(job_t *job) {
+  const char *reason = app_is_shutting_down() ? "payload is shutting down" : "cancelled by user";
+
   queue_lock();
   job_set_state(job, JOB_CANCELLED);
   queue_save_job(g_app.queue, job);
   queue_unlock();
-  log_info("[%s] download: stopped (payload is shutting down)", job->id);
+  log_info("[%s] download: stopped (%s)", job->id, reason);
 }
 
 static void
@@ -1184,16 +1233,23 @@ download_job(finalize_queue_t *fq, job_t *job) {
   {
     char verify_err[256];
 
+    /* job_busy_begin()/job_busy_end() bracket this whole block (not just
+     * one call): queue_remove_job() must refuse to free job for as long as
+     * any of these blocking calls -- or the state/log writes right after
+     * one aborts -- might still touch it, see job.h's busy comment. */
+    job_busy_begin(job);
+
     if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
       char repair_err[256];
 
-      if (app_is_shutting_down()) { job_mark_stopped(job); return; }
+      if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
 
       log_warn("[%s] download (%s): PAR2 verify failed (%s) - attempting repair",
                job->id, job->name, verify_err);
 
       if (!par2_repair_job(job, repair_err, sizeof repair_err)) {
-        if (app_is_shutting_down()) { job_mark_stopped(job); return; }
+        if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
+        job_busy_end(job);
         log_error("[%s] download (%s): %s", job->id, job->name, repair_err);
         queue_lock();
         snprintf(job->last_error, sizeof job->last_error, "%s", repair_err);
@@ -1207,7 +1263,8 @@ download_job(finalize_queue_t *fq, job_t *job) {
        * and disk writes went through without a fatal error -- the real
        * confirmation is re-running verify and having it actually pass. */
       if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
-        if (app_is_shutting_down()) { job_mark_stopped(job); return; }
+        if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
+        job_busy_end(job);
         log_error("[%s] download (%s): repair completed but re-verification still failed - %s",
                    job->id, job->name, verify_err);
         queue_lock();
@@ -1221,6 +1278,8 @@ download_job(finalize_queue_t *fq, job_t *job) {
 
       log_info("[%s] download (%s): PAR2 repair succeeded, re-verified OK", job->id, job->name);
     }
+
+    job_busy_end(job);
   }
 
   /* Download+verify+repair done -- hand extract+finalize to the finalizer
@@ -1252,8 +1311,15 @@ finalizer_main(void *arg) {
       continue;
     }
 
+    /* Bracketed the same way as download_job()'s verify/repair block --
+     * finalize_job() blocks inside extract_job() for as long as the
+     * archive takes, only checking in via extract_progress_update(), so
+     * queue_remove_job() needs job->busy to know this thread is still
+     * dereferencing job even after its state says JOB_CANCELLED. */
+    job_busy_begin(job);
     if (!finalize_job(job, finalize_err, sizeof finalize_err)) {
-      if (app_is_shutting_down()) { job_mark_stopped(job); continue; }
+      job_busy_end(job);
+      if (app_is_shutting_down() || job_was_cancelled(job)) { job_mark_stopped(job); continue; }
       log_error("[%s] download (%s): %s", job->id, job->name, finalize_err);
       queue_lock();
       snprintf(job->last_error, sizeof job->last_error, "%s", finalize_err);
@@ -1262,6 +1328,7 @@ finalizer_main(void *arg) {
       queue_unlock();
       continue;
     }
+    job_busy_end(job);
 
     log_info("[%s] download (%s): completed", job->id, job->name);
     queue_lock();

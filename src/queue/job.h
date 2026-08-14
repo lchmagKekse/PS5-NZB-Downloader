@@ -45,6 +45,19 @@ typedef struct {
   char         id[JOB_ID_LEN];
   char         name[256];       /* display name, typically the NZB filename */
   job_state_t  state;
+
+  /* True while download.c's downloader/finalizer thread is inside a long
+   * blocking call (PAR2 verify/repair, archive extraction) that still
+   * dereferences this job_t after an API handler may already have flipped
+   * state to JOB_CANCELLED out from under it -- state alone can't tell
+   * queue_remove_job() that, since Cancel sets state immediately, before
+   * the worker thread has actually noticed and unwound (see download.c's
+   * job_busy_begin()/job_busy_end()). Runtime-only, never persisted --
+   * job_save() doesn't write it and job_load() leaves it at its calloc'd
+   * 0, which is correct since nothing can be mid-operation on a job just
+   * loaded from disk. */
+  int          busy;
+
   int          priority;         /* queue ordering; higher runs first, ties broken by add order */
   int          retries_used;
   char         last_error[256];  /* empty when there is no error */
