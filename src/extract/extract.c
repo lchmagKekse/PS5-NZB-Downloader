@@ -108,13 +108,15 @@ classify(const char *name, archive_id_t *out) {
     return 1;
   }
 
-  /* Old-style continuation "<base>.rNN". */
   {
     const char *p = strrchr(name, '.');
-    if (p && (p[1] == 'r' || p[1] == 'R') && all_digits(p + 2, strlen(p + 2))) {
+    if (p && isalpha((unsigned char)p[1]) &&
+        tolower((unsigned char)p[1]) >= 'r' && tolower((unsigned char)p[1]) <= 'z' &&
+        all_digits(p + 2, strlen(p + 2))) {
+      int letter_offset = tolower((unsigned char)p[1]) - 'r';
       set_base(out, name, (size_t)(p - name));
       out->kind = AKIND_RAR;
-      out->volume = 1 + strtol(p + 2, NULL, 10); /* r00 -> 1, r01 -> 2, ... -- always after the plain .rar's volume 0 */
+      out->volume = 1 + letter_offset * 100 + strtol(p + 2, NULL, 10); /* r00 -> 1, ..., r99 -> 100, s00 -> 101, ... */
       return 1;
     }
   }
@@ -183,7 +185,9 @@ is_safe_relpath(const char *p) {
 
 static int
 copy_data(struct archive *ar, struct archive *aw, const char *display_name, const char *job_id,
-          progress_t *pg, char *err, size_t err_size) {
+          la_int64_t entry_size, progress_t *pg, char *err, size_t err_size) {
+  la_int64_t copied = 0;
+
   for (;;) {
     const void *buff;
     size_t size;
@@ -193,17 +197,27 @@ copy_data(struct archive *ar, struct archive *aw, const char *display_name, cons
     if (r == ARCHIVE_EOF) return 0;
     if (r != ARCHIVE_OK) {
       if (r == ARCHIVE_WARN) {
-        log_warn("[%s] extract: %s: %s", job_id, display_name, archive_error_string(ar));
+        log_warn("[%s] extract: %s: %s (after %lld/%lld bytes, %.1f%%)", job_id, display_name,
+                 archive_error_string(ar), (long long)copied, (long long)entry_size,
+                 entry_size > 0 ? (100.0 * (double)copied / (double)entry_size) : 0.0);
       } else {
-        snprintf(err, err_size, "%s: read error: %s", display_name, archive_error_string(ar));
+        log_error("[%s] extract: %s: read error after %lld/%lld bytes (%.1f%%): %s",
+                  job_id, display_name, (long long)copied, (long long)entry_size,
+                  entry_size > 0 ? (100.0 * (double)copied / (double)entry_size) : 0.0,
+                  archive_error_string(ar));
+        snprintf(err, err_size, "%s: read error after %lld/%lld bytes: %s",
+                 display_name, (long long)copied, (long long)entry_size, archive_error_string(ar));
         return -1;
       }
     }
 
     if (archive_write_data_block(aw, buff, size, offset) != ARCHIVE_OK) {
-      snprintf(err, err_size, "%s: write error: %s", display_name, archive_error_string(aw));
+      snprintf(err, err_size, "%s: write error after %lld/%lld bytes: %s",
+               display_name, (long long)copied, (long long)entry_size, archive_error_string(aw));
       return -1;
     }
+
+    copied += (la_int64_t)size;
 
     if (report_progress(pg, size)) {
       snprintf(err, err_size, "%s: extraction aborted", display_name);
@@ -311,7 +325,7 @@ extract_one_archive(const char **volumes, const char *dest_dir, const job_t *job
     }
 
     if (archive_entry_size(entry) > 0 &&
-        copy_data(a, ext, full_path, job->id, pg, err, err_size) < 0) {
+        copy_data(a, ext, full_path, job->id, archive_entry_size(entry), pg, err, err_size) < 0) {
       rc = -1;
       break;
     }
@@ -608,9 +622,15 @@ extract_group_fn(const char *dir, const char **paths, size_t gcount, void *ctx_)
   nested_extract_ctx_t *ctx = ctx_;
   char nested_err[256];
   size_t pi;
+  long long on_disk_total = 0;
 
-  log_info("[%s] extract: found nested archive inside %s: %zu volume(s) starting with %s",
-           ctx->job->id, dir, gcount, paths[0]);
+  for (pi = 0; pi < gcount; pi++) {
+    struct stat st;
+    if (stat(paths[pi], &st) == 0) on_disk_total += (long long)st.st_size;
+  }
+
+  log_info("[%s] extract: found nested archive inside %s: %zu volume(s), %s .. %s (%lld bytes on disk)",
+           ctx->job->id, dir, gcount, paths[0], paths[gcount - 1], on_disk_total);
 
   nested_err[0] = 0;
   if (extract_one_archive(paths, dir, ctx->job, ctx->pg, nested_err, sizeof nested_err) == 0) {
