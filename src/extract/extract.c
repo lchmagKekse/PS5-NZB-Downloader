@@ -409,6 +409,8 @@ peek_archive_total_bytes(const char **volumes, const job_t *job) {
   struct archive *a;
   long long total = 0;
   size_t pi;
+  void *rar5_ctx = NULL;
+  int rc;
 
   if (!(a = archive_read_new())) return -1;
   archive_read_support_format_all(a);
@@ -418,8 +420,17 @@ peek_archive_total_bytes(const char **volumes, const job_t *job) {
     archive_read_add_passphrase(a, job->passwords[pi]);
   }
 
-  if (archive_read_open_filenames(a, volumes, ARCHIVE_READ_BLOCK_SIZE) != ARCHIVE_OK) {
+  /* Same header-encrypted detection as extract_one_archive(): stock
+   * libarchive can't parse a RAR5 "headers encrypted" archive at all, so
+   * without this the loop below reads zero entries and silently reports a
+   * total of 0 instead of falling back to on-disk sizing. */
+  rc = rar5_headers_encrypted(volumes[0])
+           ? rar5_open_encrypted(a, job, volumes, &rar5_ctx)
+           : archive_read_open_filenames(a, volumes, ARCHIVE_READ_BLOCK_SIZE);
+
+  if (rc != ARCHIVE_OK) {
     archive_read_free(a);
+    rar5_stream_free(rar5_ctx);
     return -1;
   }
 
@@ -438,6 +449,7 @@ peek_archive_total_bytes(const char **volumes, const job_t *job) {
 
   archive_read_close(a);
   archive_read_free(a);
+  rar5_stream_free(rar5_ctx);
   return total;
 }
 
