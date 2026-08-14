@@ -35,3 +35,12 @@ void downloader_stop(downloader_t *d);
  * placed it. out[0] is left 0 if no output_dir is configured at all (see
  * download.c's job_output_dest_dir() for the exact rule). */
 void job_output_dest_dir(const job_t *job, char *out, size_t out_size);
+
+/* Resolves job->nfo_path (job.h) if it isn't already resolved: no-op unless
+ * job->state is JOB_COMPLETED and this hasn't run for the job yet (see
+ * job->nfo_checked). finalize_job() already calls this once extraction
+ * lands, so it's normally a no-op by the time the API needs it -- this
+ * exists mainly to lazily backfill it for jobs completed by a build before
+ * this field existed. Safe to call under queue_lock (no I/O beyond the
+ * bounded directory scan itself). */
+void job_ensure_nfo_scanned(job_t *job);

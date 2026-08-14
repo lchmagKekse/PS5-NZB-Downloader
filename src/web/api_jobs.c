@@ -23,7 +23,10 @@ api_jobs_list(struct MHD_Connection *conn) {
 
   queue_lock();
   n = queue_list_jobs(g_app.queue, jobs, MAX_JOBS_LISTED);
-  for (i = 0; i < n; i++) cJSON_AddItemToArray(arr, job_to_json_summary(jobs[i]));
+  for (i = 0; i < n; i++) {
+    job_ensure_nfo_scanned(jobs[i]);
+    cJSON_AddItemToArray(arr, job_to_json_summary(jobs[i]));
+  }
   queue_unlock();
 
   return json_respond(conn, MHD_HTTP_OK, arr);
@@ -36,10 +39,186 @@ api_jobs_get(struct MHD_Connection *conn, const char *id) {
 
   queue_lock();
   job = queue_find_job(g_app.queue, id);
-  if (job) body = job_to_json_detail(job);
+  if (job) {
+    job_ensure_nfo_scanned(job);
+    body = job_to_json_detail(job);
+  }
   queue_unlock();
 
   if (!body) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no such job");
+  return json_respond(conn, MHD_HTTP_OK, body);
+}
+
+#define NFO_MAX_BYTES (2 * 1024 * 1024) /* real .nfo files are a few KB at most; this is just a sanity cap */
+
+/* True if s (len bytes) is well-formed UTF-8. Not just "no high bytes" --
+ * classic CP437 .nfo art is packed with bytes >= 0x80, but real UTF-8
+ * multi-byte sequences follow a strict continuation-byte pattern that
+ * random CP437 box-drawing runs essentially never satisfy, so this
+ * reliably tells the two apart (see cp437_to_utf8() below). */
+static int
+is_valid_utf8(const unsigned char *s, size_t len) {
+  size_t i, j, extra;
+  unsigned int cp;
+  unsigned char c;
+
+  for (i = 0; i < len; i += extra + 1) {
+    c = s[i];
+
+    if (c < 0x80)                 { extra = 0; cp = c; }
+    else if ((c & 0xE0) == 0xC0)  { extra = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0)  { extra = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0)  { extra = 3; cp = c & 0x07; }
+    else return 0;
+
+    if (i + extra >= len) return 0;
+
+    for (j = 1; j <= extra; j++) {
+      unsigned char cc = s[i + j];
+      if ((cc & 0xC0) != 0x80) return 0;
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+
+    if ((extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) ||
+        (extra == 3 && cp < 0x10000) || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+/* CP437 (IBM PC/MS-DOS "OEM-US" codepage) upper half -> Unicode -- 0x00-0x7F
+ * is identical to ASCII, so only 0x80-0xFF needs a table. This is the
+ * codepage classic scene .nfo box-drawing/block art is authored in; a .nfo
+ * never declares its own encoding, so it has to be assumed whenever the raw
+ * bytes aren't already valid UTF-8 (see is_valid_utf8() above -- some newer
+ * releases do author their .nfo directly in UTF-8, which is left alone). */
+static const unsigned short cp437_upper[128] = {
+  0x00C7,0x00FC,0x00E9,0x00E2,0x00E4,0x00E0,0x00E5,0x00E7,
+  0x00EA,0x00EB,0x00E8,0x00EF,0x00EE,0x00EC,0x00C4,0x00C5,
+  0x00C9,0x00E6,0x00C6,0x00F4,0x00F6,0x00F2,0x00FB,0x00F9,
+  0x00FF,0x00D6,0x00DC,0x00A2,0x00A3,0x00A5,0x20A7,0x0192,
+  0x00E1,0x00ED,0x00F3,0x00FA,0x00F1,0x00D1,0x00AA,0x00BA,
+  0x00BF,0x2310,0x00AC,0x00BD,0x00BC,0x00A1,0x00AB,0x00BB,
+  0x2591,0x2592,0x2593,0x2502,0x2524,0x2561,0x2562,0x2556,
+  0x2555,0x2563,0x2551,0x2557,0x255D,0x255C,0x255B,0x2510,
+  0x2514,0x2534,0x252C,0x251C,0x2500,0x253C,0x255E,0x255F,
+  0x255A,0x2554,0x2569,0x2566,0x2560,0x2550,0x256C,0x2567,
+  0x2568,0x2564,0x2565,0x2559,0x2558,0x2552,0x2553,0x256B,
+  0x256A,0x2518,0x250C,0x2588,0x2584,0x258C,0x2590,0x2580,
+  0x03B1,0x00DF,0x0393,0x03C0,0x03A3,0x03C3,0x00B5,0x03C4,
+  0x03A6,0x0398,0x03A9,0x03B4,0x221E,0x03C6,0x03B5,0x2229,
+  0x2261,0x00B1,0x2265,0x2264,0x2320,0x2321,0x00F7,0x2248,
+  0x00B0,0x2219,0x00B7,0x221A,0x207F,0x00B2,0x25A0,0x00A0,
+};
+
+/* Encodes cp (always <= 0xFFFF, all cp437_upper/ASCII ever produces) as
+ * UTF-8 into out (room for 3 bytes needed). Returns bytes written. */
+static size_t
+utf8_encode(unsigned int cp, char *out) {
+  if (cp < 0x80) {
+    out[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  out[0] = (char)(0xE0 | (cp >> 12));
+  out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  out[2] = (char)(0x80 | (cp & 0x3F));
+  return 3;
+}
+
+/* Converts len bytes of CP437 text at in to a malloc'd, NUL-terminated
+ * UTF-8 string (len*3+1 bytes is always enough -- one CP437 byte is always
+ * exactly one codepoint, and every codepoint here fits in 3 UTF-8 bytes).
+ * Returns NULL on allocation failure. */
+static char *
+cp437_to_utf8(const unsigned char *in, size_t len) {
+  char *out;
+  size_t oi = 0, i;
+
+  if (!(out = malloc(len * 3 + 1))) return NULL;
+
+  for (i = 0; i < len; i++) {
+    unsigned char c = in[i];
+    oi += utf8_encode(c < 0x80 ? c : cp437_upper[c - 0x80], out + oi);
+  }
+  out[oi] = 0;
+
+  return out;
+}
+
+enum MHD_Result
+api_jobs_get_nfo(struct MHD_Connection *conn, const char *id) {
+  job_t *job;
+  char nfo_path[900] = {0};
+  char *content;
+  const char *fname;
+  long size;
+  FILE *f;
+  cJSON *body;
+
+  queue_lock();
+  job = queue_find_job(g_app.queue, id);
+  if (job) {
+    job_ensure_nfo_scanned(job);
+    snprintf(nfo_path, sizeof nfo_path, "%s", job->nfo_path);
+  }
+  queue_unlock();
+
+  if (!job) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no such job");
+  if (!nfo_path[0]) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no .nfo file found for this job");
+
+  if (!(f = fopen(nfo_path, "rb"))) {
+    log_error("api_jobs_get_nfo: fopen(%s): %s", nfo_path, strerror(errno));
+    return json_respond_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "could not open .nfo file");
+  }
+
+  fseek(f, 0, SEEK_END);
+  size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  if (size < 0 || size > NFO_MAX_BYTES) {
+    fclose(f);
+    return json_respond_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "nfo file is too large to display");
+  }
+
+  if (!(content = malloc((size_t)size + 1))) {
+    fclose(f);
+    return json_respond_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "out of memory reading .nfo file");
+  }
+  if (fread(content, 1, (size_t)size, f) != (size_t)size) {
+    fclose(f);
+    free(content);
+    return json_respond_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "short read on .nfo file");
+  }
+  content[size] = 0;
+  fclose(f);
+
+  /* .nfo files never declare an encoding -- if these bytes don't already
+   * form valid UTF-8, assume the classic scene CP437 art codepage rather
+   * than ship raw bytes the browser's UTF-8 JSON parser would mangle into
+   * replacement characters. */
+  if (!is_valid_utf8((const unsigned char *)content, (size_t)size)) {
+    char *converted = cp437_to_utf8((const unsigned char *)content, (size_t)size);
+    if (converted) {
+      free(content);
+      content = converted;
+    }
+  }
+
+  fname = strrchr(nfo_path, '/');
+  fname = fname ? fname + 1 : nfo_path;
+
+  body = cJSON_CreateObject();
+  cJSON_AddStringToObject(body, "filename", fname);
+  cJSON_AddStringToObject(body, "content", content);
+  free(content);
+
   return json_respond(conn, MHD_HTTP_OK, body);
 }
 

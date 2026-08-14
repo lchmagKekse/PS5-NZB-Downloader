@@ -9,6 +9,10 @@ enum MHD_Result api_status_get(struct MHD_Connection *conn);
 
 enum MHD_Result api_jobs_list(struct MHD_Connection *conn);
 enum MHD_Result api_jobs_get(struct MHD_Connection *conn, const char *id);
+/* {"filename": "...", "content": "..."} for the first .nfo file found under
+ * the job's output directory (see job_ensure_nfo_scanned(), download.h).
+ * 404 if the job doesn't exist, or has no .nfo (yet, or ever). */
+enum MHD_Result api_jobs_get_nfo(struct MHD_Connection *conn, const char *id);
 /* nzb_data/nzb_len/nzb_filename come from the multipart "nzb" field
  * (httpd.c's upload_iterator). display_name, if non-empty, overrides
  * nzb_filename as the job's name/output subdir; output_dir, if non-empty,

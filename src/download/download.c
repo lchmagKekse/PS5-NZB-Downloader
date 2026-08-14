@@ -9,6 +9,7 @@
  * byte offset from its article's "=ypart begin=/end=" line (0 for a
  * single-part article) -- exact placement, no assembly pass. A segment
  * that fails CRC or yEnc framing is left unmarked for nntp_pool's retry. */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -909,6 +910,66 @@ job_output_dest_dir(const job_t *job, char *out, size_t out_size) {
   snprintf(out, out_size, "%s/%s", output_dir, subdir);
 }
 
+#define NFO_SEARCH_MAX_DEPTH 3
+
+static int
+has_nfo_suffix(const char *name) {
+  size_t len = strlen(name);
+  return len > 4 && !strcasecmp(name + len - 4, ".nfo");
+}
+
+static int
+find_nfo_recursive(const char *dir, char *out_path, size_t out_size, int depth) {
+  DIR *d = opendir(dir);
+  struct dirent *ent;
+  int found = 0;
+
+  if (!d) return 0;
+
+  while (!found && (ent = readdir(d))) {
+    char child[900];
+    struct stat st;
+
+    if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+    snprintf(child, sizeof child, "%s/%s", dir, ent->d_name);
+    if (stat(child, &st) != 0) continue;
+
+    if (S_ISREG(st.st_mode) && has_nfo_suffix(ent->d_name)) {
+      snprintf(out_path, out_size, "%s", child);
+      found = 1;
+    }
+  }
+
+  if (!found && depth > 1) {
+    rewinddir(d);
+    while (!found && (ent = readdir(d))) {
+      char child[900];
+      struct stat st;
+
+      if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+      snprintf(child, sizeof child, "%s/%s", dir, ent->d_name);
+      if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+        found = find_nfo_recursive(child, out_path, out_size, depth - 1);
+      }
+    }
+  }
+
+  closedir(d);
+  return found;
+}
+
+void
+job_ensure_nfo_scanned(job_t *job) {
+  char dest_dir[900];
+
+  if (job->state != JOB_COMPLETED) return;
+  if (job->nfo_path[0] || job->nfo_checked) return; /* already resolved, one way or the other */
+
+  job_output_dest_dir(job, dest_dir, sizeof dest_dir);
+  if (dest_dir[0]) find_nfo_recursive(dest_dir, job->nfo_path, sizeof job->nfo_path, NFO_SEARCH_MAX_DEPTH);
+  job->nfo_checked = 1;
+}
+
 /* Moves src to dst: rename() first, falling back to copy+delete on EXDEV
  * (temp_dir/output_dir on different filesystems -- plausible with
  * multiple mounted USB drives). chmod's dst 0777 since files may arrive
@@ -1348,6 +1409,7 @@ finalizer_main(void *arg) {
     log_info("[%s] download (%s): completed", job->id, job->name);
     queue_lock();
     job_set_state(job, JOB_COMPLETED);
+    job_ensure_nfo_scanned(job); /* before the save just below, so nfo_path is persisted immediately */
     queue_save_job(g_app.queue, job);
     queue_unlock();
   }

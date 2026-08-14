@@ -194,6 +194,9 @@ function jobActionButtons(job) {
     `<button type="button" class="icon-btn ${cls || ''}" title="${label}" aria-label="${label}" onclick="jobAction('${job.id}','${action}')"><i class="fa-solid ${icon}"></i></button>`;
 
   const parts = [];
+  if (job.has_nfo) {
+    parts.push(`<button type="button" class="icon-btn" title="View NFO" aria-label="View NFO" onclick="viewNfo('${job.id}')"><i class="fa-solid fa-file"></i></button>`);
+  }
   if (job.state === 'queued' || job.state === 'downloading') parts.push(btn('fa-pause', 'pause', 'Pause'));
   if (job.state === 'paused') parts.push(btn('fa-play', 'resume', 'Resume'));
   if (job.state === 'failed' || job.state === 'cancelled') parts.push(btn('fa-arrow-rotate-right', 'retry', 'Retry'));
@@ -282,6 +285,28 @@ function confirmModal(message, { title = 'Confirm', confirmLabel = 'Confirm', da
     confirmBtn.addEventListener('click', onConfirmClick);
     return () => confirmBtn.removeEventListener('click', onConfirmClick);
   });
+}
+
+/* Pico-styled native <dialog> showing a .nfo file's raw text -- expects
+ * index.html's #nfo-modal markup. View-only, so unlike confirmModal/
+ * renamePrompt there's nothing for the caller to await; runModal's default
+ * cancel/backdrop/ESC wiring is all this needs. */
+function showNfoModal(filename, content) {
+  const dialog = document.getElementById('nfo-modal');
+  if (!dialog) return;
+
+  dialog.querySelector('#nfo-modal-title').textContent = filename;
+  dialog.querySelector('#nfo-modal-content').textContent = content;
+  runModal(dialog, null, () => {});
+}
+
+async function viewNfo(id) {
+  try {
+    const data = await apiGet('/api/jobs/' + encodeURIComponent(id) + '/nfo');
+    showNfoModal(data.filename, data.content);
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 /* "Some.Release.Name.2024.nzb" -> "Some Release Name 2024" -- the default

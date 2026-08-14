@@ -85,6 +85,22 @@ typedef struct {
    * a PS5 title layout and registered (see ../storage/shadowmount.h). */
   int          add_to_shadowmount;
 
+  /* Absolute path to a .nfo file found under the job's output directory,
+   * or empty if none was found -- filled in by job_ensure_nfo_scanned()
+   * (download.c), which finalize_job() calls once a job completes so this
+   * is normally already resolved by the time the API needs it. Powers the
+   * NFO viewer button (see job_json.c, web/api_jobs.c). Persisted like
+   * final_bytes so a restart doesn't lose it. */
+  char         nfo_path[900];
+
+  /* True once job_ensure_nfo_scanned() has run for this job, regardless of
+   * whether it found anything -- distinguishes "confirmed no .nfo exists"
+   * (nfo_path empty, nfo_checked set) from "not looked yet" (both empty/0),
+   * e.g. for a job completed by a build before this field existed.
+   * Runtime-only, never persisted -- same reasoning as `busy` above: a job
+   * just loaded from disk can't have been checked yet by this process. */
+  int          nfo_checked;
+
   job_file_t  *files;
   size_t       file_count;
   size_t       file_capacity;

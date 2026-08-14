@@ -419,6 +419,21 @@ table td, table th { background: transparent; }
 #rename-modal small { display: block; margin: -.5rem 0 1rem; }
 #rename-modal .shadowmount-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
 
+#nfo-modal article { width: 90vw; max-width: 60rem; }
+.nfo-viewer {
+  max-height: 65vh;
+  overflow: auto;
+  background: var(--pico-card-sectioning-background-color);
+  border-radius: var(--pico-border-radius);
+  padding: .75rem 1rem;
+  margin: 0;
+  font-family: 'Cascadia Mono', 'Cascadia Code', Consolas, 'DejaVu Sans Mono',
+               'Noto Sans Mono', 'Liberation Mono', 'Courier New', monospace;
+  font-size: .78rem;
+  line-height: 1.4;
+  white-space: pre;
+}
+
 button.danger {
   background: #e05c5c;
   border-color: #e05c5c;

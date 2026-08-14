@@ -78,6 +78,7 @@ job_to_json_summary(const job_t *job) {
   cJSON_AddStringToObject(o, "last_error", job->last_error);
   cJSON_AddStringToObject(o, "output_dir", job->output_dir);
   cJSON_AddBoolToObject(o, "add_to_shadowmount", job->add_to_shadowmount);
+  cJSON_AddBoolToObject(o, "has_nfo", job->nfo_path[0] != 0);
   /* Count only, not the passwords themselves -- distinguishes "none
    * known" from "had one, it just didn't work" without echoing them. */
   cJSON_AddNumberToObject(o, "password_count", (double)job->password_count);

@@ -145,9 +145,18 @@ route_get(struct MHD_Connection *conn, const char *url) {
   if (!strcmp(url, "/api/logs/download")) return api_logs_download(conn);
 
   if (!strncmp(url, "/api/jobs/", 10)) {
-    const char *id = url + 10;
-    if (id[0] == 0) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "missing job id");
-    return api_jobs_get(conn, id);
+    const char *rest = url + 10;
+    char id[64];
+    const char *action;
+
+    if (rest[0] == 0) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "missing job id");
+
+    if (split_id_action(rest, id, sizeof id, &action) == 0) {
+      if (!strcmp(action, "nfo")) return api_jobs_get_nfo(conn, id);
+      return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "unknown job sub-resource");
+    }
+
+    return api_jobs_get(conn, rest);
   }
 
   if (!strncmp(url, "/api/", 5)) {

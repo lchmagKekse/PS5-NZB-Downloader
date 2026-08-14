@@ -211,6 +211,7 @@ job_save(const job_t *job, const char *path) {
   cJSON_AddNumberToObject(root, "final_bytes", (double)job->final_bytes);
   cJSON_AddStringToObject(root, "output_dir", job->output_dir);
   cJSON_AddBoolToObject(root, "add_to_shadowmount", job->add_to_shadowmount);
+  cJSON_AddStringToObject(root, "nfo_path", job->nfo_path);
 
   {
     cJSON *passwords = cJSON_CreateArray();
@@ -310,7 +311,7 @@ job_load(const char *path) {
   cJSON *root, *files, *file_item;
   job_t *job;
   const cJSON *id, *name, *state, *priority, *retries, *last_error, *final_bytes;
-  const cJSON *output_dir, *add_to_shadowmount;
+  const cJSON *output_dir, *add_to_shadowmount, *nfo_path;
 
   if (!(f = fopen(path, "rb"))) {
     log_error("job: fopen(%s): %s", path, strerror(errno));
@@ -357,6 +358,7 @@ job_load(const char *path) {
   final_bytes = cJSON_GetObjectItemCaseSensitive(root, "final_bytes");
   output_dir  = cJSON_GetObjectItemCaseSensitive(root, "output_dir");
   add_to_shadowmount = cJSON_GetObjectItemCaseSensitive(root, "add_to_shadowmount");
+  nfo_path    = cJSON_GetObjectItemCaseSensitive(root, "nfo_path");
 
   if (cJSON_IsString(id))   snprintf(job->id, sizeof job->id, "%s", id->valuestring);
   if (cJSON_IsString(name)) snprintf(job->name, sizeof job->name, "%s", name->valuestring);
@@ -367,6 +369,7 @@ job_load(const char *path) {
   if (cJSON_IsNumber(final_bytes)) job->final_bytes = (long long)final_bytes->valuedouble;
   if (cJSON_IsString(output_dir)) snprintf(job->output_dir, sizeof job->output_dir, "%s", output_dir->valuestring);
   job->add_to_shadowmount = cJSON_IsTrue(add_to_shadowmount);
+  if (cJSON_IsString(nfo_path)) snprintf(job->nfo_path, sizeof job->nfo_path, "%s", nfo_path->valuestring);
 
   {
     const cJSON *passwords = cJSON_GetObjectItemCaseSensitive(root, "passwords");
