@@ -22,9 +22,9 @@
 <main class="container-fluid">
   <article>
     <div class="stats-grid" id="stats">
-      <div class="stat"><div class="label"><i class="fa-solid fa-layer-group"></i> Queue</div><div class="value" id="stat-queue">-</div></div>
+      <div class="stat stat-queue"><div class="label"><i class="fa-solid fa-layer-group"></i> Queue</div><div class="value" id="stat-queue">-</div></div>
       <div class="stat"><div class="label"><i class="fa-solid fa-gauge-high"></i> Speed</div><div class="value" id="stat-speed">-</div></div>
-      <div class="stat"><div class="label"><i class="fa-solid fa-ethernet"></i> Connections</div><div class="value" id="stat-conns">-</div></div>
+      <div class="stat stat-conns"><div class="label"><i class="fa-solid fa-ethernet"></i> Connections</div><div class="value" id="stat-conns">-</div></div>
       <label class="dropzone stat" id="dropzone" for="nzb-files">
         <i class="fa-solid fa-cloud-arrow-up"></i>
         <div>Drag &amp; drop .nzb files here, or click to browse</div>
@@ -33,7 +33,7 @@
     </div>
   </article>
 
-  <article>
+  <article class="jobs-panel">
     <figure class="table-scroll">
       <table class="jobs-table">
         <thead>
@@ -44,16 +44,6 @@
         </tbody>
       </table>
     </figure>
-  </article>
-
-  <article>
-    <div class="panel-header">
-      <h3><i class="fa-solid fa-terminal"></i> Logs</h3>
-      <a href="/api/logs/download" download>
-        <i class="fa-solid fa-download fa-xl"></i>
-      </a>
-    </div>
-    <div class="log-viewer" id="logs">Loading&hellip;</div>
   </article>
 </main>
 
@@ -97,25 +87,6 @@
 
 <script src="/main.js"></script>
 <script>
-/* Upload rejections (wrong extension, malformed NZB, server error) never
- * touch the backend's own log ring buffer -- either they're caught
- * client-side before any request goes out, or the server rejects the
- * upload without logging it itself. Kept here and merged into the same
- * log box on every refresh so they show up in the one place the user is
- * already watching. Capped so a bad drag-and-drop session can't grow this
- * forever. */
-let lastServerLogs = [];
-const clientLogLines = [];
-const MAX_CLIENT_LOG_LINES = 50;
-
-function logTimestamp() {
-  return new Date().toISOString().slice(0, 19).replace('T', ' ');
-}
-
-function renderLogsView() {
-  renderLogLines(document.getElementById('logs'), [...lastServerLogs, ...clientLogLines]);
-}
-
 /* Not a terminal state -- still queued, actively downloading, or in one
  * of the post-download phases. This is what "Queue" counts, same set the
  * old separate "Active jobs" tile drew from (see api_status.c's
@@ -123,6 +94,19 @@ function renderLogsView() {
  * queued and paused jobs are just as much "up for downloading" as ones
  * currently mid-transfer, so that tile is gone and this replaces it. */
 const PENDING_STATES = ['queued', 'downloading', 'paused', 'verifying', 'repairing', 'extracting'];
+
+/* The queue API returns jobs oldest-added-first (queue_add_job() appends,
+ * see src/queue/queue.c) -- that order also drives actual download
+ * priority, so it isn't something the frontend should touch. Display order
+ * is a separate concern: reverse to put the most recently added job on
+ * top, then stable-partition so completed jobs always sink below every
+ * still-active one regardless of age. */
+function sortJobsForDisplay(jobs) {
+  const newestFirst = [...jobs].reverse();
+  const active = newestFirst.filter(j => j.state !== 'completed');
+  const completed = newestFirst.filter(j => j.state === 'completed');
+  return [...active, ...completed];
+}
 
 async function refresh() {
   try {
@@ -139,7 +123,7 @@ async function refresh() {
     if (!jobs.length) {
       rows.innerHTML = '<tr><td colspan="5" class="muted">Queue is empty</td></tr>';
     } else {
-      rows.innerHTML = jobs.map(j => `<tr>
+      rows.innerHTML = sortJobsForDisplay(jobs).map(j => `<tr>
           <td data-label="Name"><a href="/job.html?id=${encodeURIComponent(j.id)}">${escapeHtml(j.name)}</a></td>
           <td data-label="State">${stateBadge(j.state)}</td>
           <td data-label="Progress">${progressBarHtml(j)}</td>
@@ -147,21 +131,12 @@ async function refresh() {
           <td data-label="Actions">${jobActionButtons(j)}</td>
         </tr>`).join('');
     }
-
-    lastServerLogs = await apiGet('/api/logs');
-    renderLogsView();
   } catch (e) {
     console.error(e);
   }
 }
 
 window.refreshNow = refresh;
-
-function logUploadError(filename, message) {
-  clientLogLines.push(`${logTimestamp()} [ERROR] upload: ${filename}: ${message}`);
-  if (clientLogLines.length > MAX_CLIENT_LOG_LINES) clientLogLines.shift();
-  renderLogsView();
-}
 
 /* One file at a time (the upload endpoint takes a single NZB per POST,
  * see api_jobs_create()) -- each valid .nzb gets its own rename-on-add
@@ -185,7 +160,7 @@ async function queueFiles(fileList) {
 
   for (const file of files) {
     if (!/\.nzb$/i.test(file.name)) {
-      logUploadError(file.name, 'Not a .nzb file');
+      alert(file.name + ': Not a .nzb file');
       continue;
     }
 
@@ -202,7 +177,7 @@ async function queueFiles(fileList) {
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
     } catch (err) {
-      logUploadError(file.name, err.message);
+      alert(file.name + ': ' + err.message);
     }
   }
 

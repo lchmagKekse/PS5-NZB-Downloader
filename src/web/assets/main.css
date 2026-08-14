@@ -39,6 +39,40 @@
  * can beat on source order alone. */
 a, [role=link] { text-decoration: none !important; }
 
+/* Thin, color-matched scrollbars everywhere content scrolls (the log
+ * viewer, the jobs table's scroll container, dialogs, the page itself) --
+ * Pico has no opinion on scrollbar chrome, so left alone these are the
+ * browser's stock scrollbars: a boxy track and, on Chromium/WebKit, the
+ * up/down arrow buttons at each end. Firefox and WebKit style scrollbars
+ * through separate APIs, so both are covered; `*` rather than a handful of
+ * named selectors so anything that ends up scrollable (now or later) picks
+ * this up automatically instead of reverting to the OS default. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--pico-muted-border-color) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background-color: var(--pico-muted-border-color);
+  border-radius: 999px;
+  /* Transparent border + background-clip:padding-box shrinks the visible
+   * fill inward from the scrollbar's own edges, so the thumb reads as a
+   * slim bar with breathing room instead of a block wedged flush against
+   * the container -- background-color alone has no way to inset itself. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background-color: var(--pico-muted-color); }
+*::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+*::-webkit-scrollbar-corner { background: transparent; }
+
+/* Lets .jobs-panel below claim "the rest of the page" -- body is the flex
+ * column, header stays its natural height, and main.container-fluid is the
+ * single flex-growing child that the jobs panel then grows inside of. */
+html, body { height: 100%; }
+body { display: flex; flex-direction: column; }
+
 .site-header {
   /* Pico's `body>header{padding-block:var(--pico-block-spacing-vertical)}`
    * (20px+20px) stacks with the <nav>'s own padding below, which is what
@@ -73,7 +107,21 @@ a, [role=link] { text-decoration: none !important; }
  * max-width:1450px past the 1536px breakpoint (950px/1200px at smaller
  * ones), leaving a lot of dead space on the sides on a normal monitor.
  * -fluid only pads by --pico-spacing on each side, no cap. */
-main.container-fluid { padding-block: 1.5rem; }
+main.container-fluid { padding-block: 1.5rem; flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; overflow-y: auto; }
+
+/* The jobs table article on index.html -- grows to fill whatever vertical
+ * space is left in the viewport below the stats grid, instead of just
+ * being as tall as its rows. min-height:0 lets it actually shrink below
+ * its content size so .table-scroll's own overflow-y takes over rather
+ * than the whole page growing taller than the viewport. */
+.jobs-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
+.jobs-panel .table-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.jobs-panel .jobs-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--pico-card-background-color);
+  z-index: 1;
+}
 
 .stats-grid {
   display: grid;
@@ -314,9 +362,27 @@ table td, table th { background: transparent; }
     gap: 1rem 0;
   }
   .field.checkbox { padding-bottom: 0; }
+  /* .spacer only earns its keep lining the checkbox up with the label row
+   * of the text field beside it (see that rule's own comment) -- once
+   * cols-3 above stacks everything into one column there's no label beside
+   * it to line up with, so the invisible label just reads as a dead gap
+   * above the TLS/SSL checkbox. */
+  .field.checkbox .spacer { display: none; }
 }
 
 @media (max-width: 640px) {
+  /* Icon-only dropzone on small screens -- the "Drag & drop .nzb files
+   * here, or click to browse" hint doesn't fit the tile at this width
+   * without wrapping awkwardly, and dragging files onto a touchscreen
+   * isn't a thing anyway; the label still covers the whole tile so tapping
+   * to browse still works without the text spelling it out. */
+  .stats-grid .dropzone div { display: none; }
+
+  /* Queue/Connections eat two whole tiles' worth of width on a phone-size
+   * grid -- Speed and the dropzone are the two tiles worth keeping visible
+   * at this width. */
+  .stat-queue, .stat-conns { display: none; }
+
   table, thead, tbody, tr, th, td { display: block; }
   thead { display: none; }
   tr { border-bottom: 1px solid var(--pico-muted-border-color); padding: .5rem 0; }

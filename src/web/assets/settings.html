@@ -58,10 +58,20 @@
   </form>
 
   <article>
+    <div class="panel-header">
+      <h3>Logs</h3>
+      <a href="/api/logs/download" download>
+        <i class="fa-solid fa-download fa-xl"></i>
+      </a>
+    </div>
+    <div class="log-viewer" id="logs">Loading&hellip;</div>
+  </article>
+
+  <article style="margin-bottom:0;">
     <h3 style="margin-top:0;">Miscellaneous</h3>
-    <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-code-branch"></i> Source Code</a>
-    <a role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader/issues/new" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-bug"></i> Report a bug</a>
-    <button type="button" id="eject-btn" class="danger"><i class="fa-solid fa-eject"></i> Eject</button>
+    <a style="margin:5px;" role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-code-branch"></i> Source Code</a>
+    <a style="margin:5px;" role="button" href="https://github.com/lchmagKekse/PS5-NZB-Downloader/issues/new" target="_blank" rel="noopener noreferrer"><i class="fa-solid fa-bug"></i> Report a bug</a>
+    <button style="margin:5px;" type="button" id="eject-btn" class="danger"><i class="fa-solid fa-eject"></i> Eject</button>
   </article>
 </main>
 
@@ -140,6 +150,17 @@ form.addEventListener('submit', async (e) => {
 load().catch(e => {
   document.getElementById('save-status').textContent = 'Failed to load: ' + e.message;
 });
+
+async function refreshLogs() {
+  try {
+    const logs = await apiGet('/api/logs');
+    renderLogLines(document.getElementById('logs'), logs);
+  } catch (e) {
+    console.error(e);
+  }
+}
+refreshLogs();
+setInterval(refreshLogs, 2000);
 
 document.getElementById('eject-btn').addEventListener('click', async () => {
   const status = document.getElementById('eject-status');
