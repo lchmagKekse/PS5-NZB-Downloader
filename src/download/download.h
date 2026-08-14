@@ -44,3 +44,12 @@ void job_output_dest_dir(const job_t *job, char *out, size_t out_size);
  * this field existed. Safe to call under queue_lock (no I/O beyond the
  * bounded directory scan itself). */
 void job_ensure_nfo_scanned(job_t *job);
+
+/* Resolves job->pkg_paths (job.h) if it isn't already resolved: no-op
+ * unless job->state is JOB_COMPLETED and this hasn't run for the job yet
+ * (see job->pkg_checked) -- same lifecycle as job_ensure_nfo_scanned()
+ * above, including the "already have results, and/or already looked"
+ * skip check. finalize_job() already calls this once extraction lands, so
+ * it's normally a no-op by the time the API needs it. Safe to call under
+ * queue_lock (no I/O beyond the bounded directory scan itself). */
+void job_ensure_pkg_scanned(job_t *job);

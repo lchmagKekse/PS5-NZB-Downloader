@@ -27,6 +27,7 @@
 #include "../par2/par2.h"
 #include "../storage/paths.h"
 #include "../storage/shadowmount.h"
+#include "../system/pkg_install.h"
 #include "../util/crc32.h"
 #include "../web/app_state.h"
 #include "../yenc/yenc.h"
@@ -970,6 +971,76 @@ job_ensure_nfo_scanned(job_t *job) {
   job->nfo_checked = 1;
 }
 
+#define PKG_SEARCH_MAX_DEPTH 3
+
+static int
+has_pkg_suffix(const char *name) {
+  size_t len = strlen(name);
+  return len > 4 && !strcasecmp(name + len - 4, ".pkg");
+}
+
+/* Collects every .pkg file under dir (up to JOB_MAX_PKGS) into job->pkg_paths
+ * via job_add_pkg_path() -- unlike find_nfo_recursive() this doesn't stop at
+ * the first match, since a title's output can legitimately contain several
+ * (base game, update, DLC). */
+static void
+find_pkgs_recursive(const char *dir, job_t *job, int depth) {
+  DIR *d = opendir(dir);
+  struct dirent *ent;
+
+  if (!d) return;
+
+  while (job->pkg_count < JOB_MAX_PKGS && (ent = readdir(d))) {
+    char child[900];
+    struct stat st;
+
+    if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+    snprintf(child, sizeof child, "%s/%s", dir, ent->d_name);
+    if (stat(child, &st) != 0) continue;
+
+    if (S_ISREG(st.st_mode) && has_pkg_suffix(ent->d_name)) {
+      job_add_pkg_path(job, child);
+    } else if (S_ISDIR(st.st_mode) && depth > 1) {
+      find_pkgs_recursive(child, job, depth - 1);
+    }
+  }
+
+  closedir(d);
+}
+
+void
+job_ensure_pkg_scanned(job_t *job) {
+  char dest_dir[900];
+
+  if (job->state != JOB_COMPLETED) return;
+  if (job->pkg_count > 0 || job->pkg_checked) return; /* already resolved, one way or the other */
+
+  job_output_dest_dir(job, dest_dir, sizeof dest_dir);
+  if (dest_dir[0]) find_pkgs_recursive(dest_dir, job, PKG_SEARCH_MAX_DEPTH);
+  job->pkg_checked = 1;
+}
+
+static void
+job_auto_install_pkgs(job_t *job) {
+  char paths[JOB_MAX_PKGS][900];
+  size_t count, i;
+
+  queue_lock();
+  count = job->auto_install_pkgs ? job->pkg_count : 0;
+  for (i = 0; i < count; i++) snprintf(paths[i], sizeof paths[i], "%s", job->pkg_paths[i]);
+  queue_unlock();
+
+  for (i = 0; i < count; i++) {
+    char err[256];
+
+    if (pkg_install_file(paths[i], err, sizeof err) == 0) {
+      log_info("[%s] download: auto-installed %s", job->id, paths[i]);
+    } else {
+      log_warn("[%s] download: auto-install failed for %s: %s", job->id, paths[i], err);
+    }
+  }
+}
+
 /* Moves src to dst: rename() first, falling back to copy+delete on EXDEV
  * (temp_dir/output_dir on different filesystems -- plausible with
  * multiple mounted USB drives). chmod's dst 0777 since files may arrive
@@ -1404,14 +1475,24 @@ finalizer_main(void *arg) {
       queue_unlock();
       continue;
     }
-    job_busy_end(job);
 
+    /* Still bracketed by the job_busy_begin() above -- not cleared until
+     * job_auto_install_pkgs() below has finished with job, since
+     * queue_remove_job() would otherwise be free to free() it the instant
+     * state reads JOB_COMPLETED with busy back at 0 (see job.h's busy
+     * comment). auto-install's own blocking pkg_install_file() calls run
+     * without queue_lock held (see that function), but job->busy still
+     * keeps job itself alive throughout. */
     log_info("[%s] download (%s): completed", job->id, job->name);
     queue_lock();
     job_set_state(job, JOB_COMPLETED);
     job_ensure_nfo_scanned(job); /* before the save just below, so nfo_path is persisted immediately */
+    job_ensure_pkg_scanned(job); /* ditto, for pkg_paths */
     queue_save_job(g_app.queue, job);
     queue_unlock();
+
+    job_auto_install_pkgs(job);
+    job_busy_end(job);
   }
 
   return NULL;

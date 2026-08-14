@@ -195,7 +195,11 @@ function jobActionButtons(job) {
 
   const parts = [];
   if (job.has_nfo) {
-    parts.push(`<button type="button" class="icon-btn" title="View NFO" aria-label="View NFO" onclick="viewNfo('${job.id}')"><i class="fa-solid fa-file"></i></button>`);
+    parts.push(`<button type="button" class="icon-btn" title="View NFO" aria-label="View NFO" onclick="viewNfo('${job.id}')"><img src="/nfo.svg" alt=""></button>`);
+  }
+  if (job.pkg_count > 0) {
+    const label = 'Install PKG' + (job.pkg_count > 1 ? 's' : '');
+    parts.push(`<button type="button" class="icon-btn" title="${label}" aria-label="${label}" onclick="installPkgs('${job.id}')"><img src="/pkg.svg" alt=""></button>`);
   }
   if (job.state === 'queued' || job.state === 'downloading') parts.push(btn('fa-pause', 'pause', 'Pause'));
   if (job.state === 'paused') parts.push(btn('fa-play', 'resume', 'Resume'));
@@ -309,27 +313,94 @@ async function viewNfo(id) {
   }
 }
 
+/* Pico-styled native <dialog> listing every .pkg file found for a job as a
+ * checked-by-default checkbox -- expects index.html's #install-pkgs-modal
+ * markup. Resolves to the array of filenames left checked when Install is
+ * clicked (never empty -- the button is disabled otherwise), or null on
+ * cancel/backdrop/ESC. */
+function installPkgsPrompt(files) {
+  const dialog = document.getElementById('install-pkgs-modal');
+  if (!dialog) return Promise.resolve(files);
+
+  const list = dialog.querySelector('#install-pkgs-modal-list');
+  const confirmBtn = dialog.querySelector('#install-pkgs-modal-confirm');
+
+  list.innerHTML = files.map((f, i) => `
+    <label class="pkg-install-row">
+      <input type="checkbox" checked data-pkg-index="${i}">
+      ${escapeHtml(f)}
+    </label>
+  `).join('');
+
+  const checkboxes = Array.from(list.querySelectorAll('input[type=checkbox]'));
+  const updateConfirmState = () => { confirmBtn.disabled = !checkboxes.some(cb => cb.checked); };
+  updateConfirmState();
+
+  return runModal(dialog, null, (settle) => {
+    const doConfirm = () => {
+      const selected = checkboxes.filter(cb => cb.checked).map(cb => files[Number(cb.dataset.pkgIndex)]);
+      if (!selected.length) return;
+      settle(selected);
+    };
+    confirmBtn.addEventListener('click', doConfirm);
+    checkboxes.forEach(cb => cb.addEventListener('change', updateConfirmState));
+    return () => {
+      confirmBtn.removeEventListener('click', doConfirm);
+      checkboxes.forEach(cb => cb.removeEventListener('change', updateConfirmState));
+    };
+  });
+}
+
+async function installPkgs(id) {
+  let job;
+  try {
+    job = await apiGet('/api/jobs/' + encodeURIComponent(id));
+  } catch (e) {
+    alert(e.message);
+    return;
+  }
+
+  const files = job.pkg_files || [];
+  if (!files.length) return;
+
+  const selected = await installPkgsPrompt(files);
+  if (!selected) return;
+
+  try {
+    await apiPost('/api/jobs/' + encodeURIComponent(id) + '/install-pkgs', { files: selected });
+    if (window.refreshNow) window.refreshNow();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
 /* "Some.Release.Name.2024.nzb" -> "Some Release Name 2024" -- the default
  * offered by the rename-on-add modal (see index.html's #rename-modal). */
 function suggestJobName(filename) {
   return filename.replace(/\.nzb$/i, '').replace(/\./g, ' ').trim();
 }
 
-/* Resolves to { name, outputDir, shadowmount } (name possibly edited from
- * suggestedName), or null if cancelled. Falls back to auto-accepting
- * suggestedName (with the given defaultOutputDir and shadowmount off) on
- * a page without #rename-modal. */
+/* Resolves to { name, outputDir, shadowmount, autoInstallPkgs } (name
+ * possibly edited from suggestedName), or null if cancelled. Falls back to
+ * auto-accepting suggestedName (with the given defaultOutputDir and both
+ * checkboxes off) on a page without #rename-modal. */
 function renamePrompt(suggestedName, defaultOutputDir) {
   const dialog = document.getElementById('rename-modal');
-  if (!dialog) return Promise.resolve({ name: suggestedName, outputDir: defaultOutputDir || '', shadowmount: false });
+  if (!dialog) {
+    return Promise.resolve({
+      name: suggestedName, outputDir: defaultOutputDir || '', shadowmount: false, autoInstallPkgs: false,
+    });
+  }
 
   const input = dialog.querySelector('#rename-input');
   const outputInput = dialog.querySelector('#rename-output-dir');
   const shadowmountInput = dialog.querySelector('#rename-shadowmount');
+  const autoInstallInput = dialog.querySelector('#rename-auto-install-pkgs');
   const confirmBtn = dialog.querySelector('#rename-modal-confirm');
   input.value = suggestedName;
   outputInput.value = defaultOutputDir || '';
   shadowmountInput.checked = false;
+  autoInstallInput.checked = false;
 
   const result = runModal(dialog, null, (settle) => {
     const doConfirm = () => {
@@ -338,6 +409,7 @@ function renamePrompt(suggestedName, defaultOutputDir) {
         name: input.value.trim(),
         outputDir: outputInput.value.trim(),
         shadowmount: shadowmountInput.checked,
+        autoInstallPkgs: autoInstallInput.checked,
       });
     };
     const onKeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doConfirm(); } };

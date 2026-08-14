@@ -51,6 +51,7 @@ APP_SRCS += src/yenc/yenc.c
 APP_SRCS += src/par2/par2.c src/par2/rs.c
 APP_SRCS += src/extract/extract.c src/extract/rar5_crypt.c
 APP_SRCS += src/download/download.c
+APP_SRCS += src/system/pkg_install.c
 APP_SRCS += src/web/app_state.c src/web/asset.c src/web/json_util.c src/web/job_json.c
 APP_SRCS += src/web/httpd.c
 APP_SRCS += src/web/api_status.c src/web/api_jobs.c src/web/api_config.c src/web/api_logs.c
@@ -74,7 +75,14 @@ RAPIDYENC_FLAGS := -I$(PS5_PAYLOAD_SDK)/target/user/homebrew/include -L$(PS5_PAY
 # program against it once to be sure, same as rapidyenc. PAR2 (src/par2)
 # is pure C with no third-party lib at all.
 ARCHIVE_FLAGS := $(shell $(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config libarchive --cflags --libs)
-APP_FLAGS   := $(SSL_FLAGS) $(EXPAT_FLAGS) $(MHD_FLAGS) $(RAPIDYENC_FLAGS) $(ARCHIVE_FLAGS)
+# No .pc file (same as rapidyenc above) -- these are plain sce_stubs, not a
+# pacbrew port. -lSceIpmi is needed alongside -lSceAppInstUtil because
+# AppInstUtil's real implementation lives inside libSceIpmi.so on the
+# console (see src/system/pkg_install.c and its matching pragma comment(lib)
+# -- confirmed against ps5-payload-dev/websrv's PKGInstall homebrew, which
+# links the same pair for the same sceAppInstUtilInstallByPackage() call).
+APPINSTUTIL_FLAGS := -lSceIpmi -lSceAppInstUtil
+APP_FLAGS   := $(SSL_FLAGS) $(EXPAT_FLAGS) $(MHD_FLAGS) $(RAPIDYENC_FLAGS) $(ARCHIVE_FLAGS) $(APPINSTUTIL_FLAGS)
 
 appcheck:
 	$(CC) $(CFLAGS) -Isrc $(APP_FLAGS) -fsyntax-only $(APP_SRCS) src/main.c

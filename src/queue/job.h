@@ -41,6 +41,8 @@ typedef enum {
 
 #define JOB_MAX_PASSWORDS 8  /* some indexers list several guesses, not just one */
 
+#define JOB_MAX_PKGS 16  /* generous cap on .pkg files found under one job's output -- multi-disc/DLC bundles rarely exceed a handful */
+
 typedef struct {
   char         id[JOB_ID_LEN];
   char         name[256];       /* display name, typically the NZB filename */
@@ -85,6 +87,13 @@ typedef struct {
    * a PS5 title layout and registered (see ../storage/shadowmount.h). */
   int          add_to_shadowmount;
 
+  /* Set from the add-NZB modal's "Automatically install PKGs" checkbox --
+   * once the job's output lands in its final directory, every .pkg file
+   * job_ensure_pkg_scanned() (download.c) finds under it is installed via
+   * pkg_install_file() (system/pkg_install.h), same as clicking "Install
+   * PKGs" manually would do. */
+  int          auto_install_pkgs;
+
   /* Absolute path to a .nfo file found under the job's output directory,
    * or empty if none was found -- filled in by job_ensure_nfo_scanned()
    * (download.c), which finalize_job() calls once a job completes so this
@@ -100,6 +109,18 @@ typedef struct {
    * Runtime-only, never persisted -- same reasoning as `busy` above: a job
    * just loaded from disk can't have been checked yet by this process. */
   int          nfo_checked;
+
+  /* Absolute paths to .pkg files found under the job's output directory --
+   * filled in by job_ensure_pkg_scanned() (download.c), same lifecycle as
+   * nfo_path/nfo_checked above. Powers the "Install PKGs" button (see
+   * job_json.c, web/api_jobs.c, system/pkg_install.h). Persisted like
+   * nfo_path so a restart doesn't lose it. */
+  char         pkg_paths[JOB_MAX_PKGS][900];
+  size_t       pkg_count;
+
+  /* True once job_ensure_pkg_scanned() has run for this job -- same
+   * runtime-only reasoning as nfo_checked above. */
+  int          pkg_checked;
 
   job_file_t  *files;
   size_t       file_count;
@@ -128,6 +149,11 @@ int job_file_add_segment(job_file_t *file, const char *message_id, long bytes, i
  * room (silently drops beyond JOB_MAX_PASSWORDS -- that many candidate
  * guesses from one NZB would be unusual). No-op if password is empty. */
 void job_add_password(job_t *job, const char *password);
+
+/* Appends path to job->pkg_paths if there's room (silently drops beyond
+ * JOB_MAX_PKGS). No dedup -- job_ensure_pkg_scanned() (download.c) only
+ * calls this once per .pkg file found. */
+void job_add_pkg_path(job_t *job, const char *path);
 
 /* Sets job->state, logging the transition. */
 void job_set_state(job_t *job, job_state_t state);

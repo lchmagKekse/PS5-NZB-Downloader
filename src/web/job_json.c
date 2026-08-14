@@ -78,7 +78,9 @@ job_to_json_summary(const job_t *job) {
   cJSON_AddStringToObject(o, "last_error", job->last_error);
   cJSON_AddStringToObject(o, "output_dir", job->output_dir);
   cJSON_AddBoolToObject(o, "add_to_shadowmount", job->add_to_shadowmount);
+  cJSON_AddBoolToObject(o, "auto_install_pkgs", job->auto_install_pkgs);
   cJSON_AddBoolToObject(o, "has_nfo", job->nfo_path[0] != 0);
+  cJSON_AddNumberToObject(o, "pkg_count", (double)job->pkg_count);
   /* Count only, not the passwords themselves -- distinguishes "none
    * known" from "had one, it just didn't work" without echoing them. */
   cJSON_AddNumberToObject(o, "password_count", (double)job->password_count);
@@ -91,7 +93,19 @@ cJSON *
 job_to_json_detail(const job_t *job) {
   cJSON *o = job_to_json_summary(job);
   cJSON *files = cJSON_CreateArray();
+  cJSON *pkg_files = cJSON_CreateArray();
   size_t fi;
+
+  /* Basenames only, for the "Install PKGs" modal's checkbox list (see
+   * main.js's installPkgs()) -- the API handler that actually installs
+   * them (api_jobs_install_pkgs()) re-derives the full paths itself from
+   * job->pkg_paths, so the client never needs to see (or round-trip) an
+   * absolute on-console path. */
+  for (fi = 0; fi < job->pkg_count; fi++) {
+    const char *base = strrchr(job->pkg_paths[fi], '/');
+    cJSON_AddItemToArray(pkg_files, cJSON_CreateString(base ? base + 1 : job->pkg_paths[fi]));
+  }
+  cJSON_AddItemToObject(o, "pkg_files", pkg_files);
 
   for (fi = 0; fi < job->file_count; fi++) {
     const job_file_t *jf = &job->files[fi];

@@ -127,6 +127,14 @@ job_add_password(job_t *job, const char *password) {
 }
 
 void
+job_add_pkg_path(job_t *job, const char *path) {
+  if (job->pkg_count >= JOB_MAX_PKGS) return;
+
+  snprintf(job->pkg_paths[job->pkg_count], sizeof job->pkg_paths[0], "%s", path);
+  job->pkg_count++;
+}
+
+void
 job_set_state(job_t *job, job_state_t state) {
   log_info("[%s] state %s -> %s", job->id, job_state_name(job->state), job_state_name(state));
   job->state = state;
@@ -211,6 +219,7 @@ job_save(const job_t *job, const char *path) {
   cJSON_AddNumberToObject(root, "final_bytes", (double)job->final_bytes);
   cJSON_AddStringToObject(root, "output_dir", job->output_dir);
   cJSON_AddBoolToObject(root, "add_to_shadowmount", job->add_to_shadowmount);
+  cJSON_AddBoolToObject(root, "auto_install_pkgs", job->auto_install_pkgs);
   cJSON_AddStringToObject(root, "nfo_path", job->nfo_path);
 
   {
@@ -219,6 +228,14 @@ job_save(const job_t *job, const char *path) {
       cJSON_AddItemToArray(passwords, cJSON_CreateString(job->passwords[fi]));
     }
     cJSON_AddItemToObject(root, "passwords", passwords);
+  }
+
+  {
+    cJSON *pkg_paths = cJSON_CreateArray();
+    for (fi = 0; fi < job->pkg_count; fi++) {
+      cJSON_AddItemToArray(pkg_paths, cJSON_CreateString(job->pkg_paths[fi]));
+    }
+    cJSON_AddItemToObject(root, "pkg_paths", pkg_paths);
   }
 
   cJSON_AddItemToObject(root, "files", files);
@@ -311,7 +328,7 @@ job_load(const char *path) {
   cJSON *root, *files, *file_item;
   job_t *job;
   const cJSON *id, *name, *state, *priority, *retries, *last_error, *final_bytes;
-  const cJSON *output_dir, *add_to_shadowmount, *nfo_path;
+  const cJSON *output_dir, *add_to_shadowmount, *auto_install_pkgs, *nfo_path;
 
   if (!(f = fopen(path, "rb"))) {
     log_error("job: fopen(%s): %s", path, strerror(errno));
@@ -358,6 +375,7 @@ job_load(const char *path) {
   final_bytes = cJSON_GetObjectItemCaseSensitive(root, "final_bytes");
   output_dir  = cJSON_GetObjectItemCaseSensitive(root, "output_dir");
   add_to_shadowmount = cJSON_GetObjectItemCaseSensitive(root, "add_to_shadowmount");
+  auto_install_pkgs = cJSON_GetObjectItemCaseSensitive(root, "auto_install_pkgs");
   nfo_path    = cJSON_GetObjectItemCaseSensitive(root, "nfo_path");
 
   if (cJSON_IsString(id))   snprintf(job->id, sizeof job->id, "%s", id->valuestring);
@@ -369,6 +387,7 @@ job_load(const char *path) {
   if (cJSON_IsNumber(final_bytes)) job->final_bytes = (long long)final_bytes->valuedouble;
   if (cJSON_IsString(output_dir)) snprintf(job->output_dir, sizeof job->output_dir, "%s", output_dir->valuestring);
   job->add_to_shadowmount = cJSON_IsTrue(add_to_shadowmount);
+  job->auto_install_pkgs = cJSON_IsTrue(auto_install_pkgs);
   if (cJSON_IsString(nfo_path)) snprintf(job->nfo_path, sizeof job->nfo_path, "%s", nfo_path->valuestring);
 
   {
@@ -376,6 +395,14 @@ job_load(const char *path) {
     const cJSON *pw_item;
     cJSON_ArrayForEach(pw_item, passwords) {
       if (cJSON_IsString(pw_item)) job_add_password(job, pw_item->valuestring);
+    }
+  }
+
+  {
+    const cJSON *pkg_paths = cJSON_GetObjectItemCaseSensitive(root, "pkg_paths");
+    const cJSON *pkg_item;
+    cJSON_ArrayForEach(pkg_item, pkg_paths) {
+      if (cJSON_IsString(pkg_item)) job_add_pkg_path(job, pkg_item->valuestring);
     }
   }
 

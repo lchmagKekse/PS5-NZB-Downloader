@@ -8,6 +8,7 @@
 #include "../nntp/nntp_pool.h"
 #include "../nzb/nzb_parse.h"
 #include "../storage/paths.h"
+#include "../system/pkg_install.h"
 #include "api.h"
 #include "app_state.h"
 #include "job_json.h"
@@ -25,6 +26,7 @@ api_jobs_list(struct MHD_Connection *conn) {
   n = queue_list_jobs(g_app.queue, jobs, MAX_JOBS_LISTED);
   for (i = 0; i < n; i++) {
     job_ensure_nfo_scanned(jobs[i]);
+    job_ensure_pkg_scanned(jobs[i]);
     cJSON_AddItemToArray(arr, job_to_json_summary(jobs[i]));
   }
   queue_unlock();
@@ -41,6 +43,7 @@ api_jobs_get(struct MHD_Connection *conn, const char *id) {
   job = queue_find_job(g_app.queue, id);
   if (job) {
     job_ensure_nfo_scanned(job);
+    job_ensure_pkg_scanned(job);
     body = job_to_json_detail(job);
   }
   queue_unlock();
@@ -222,12 +225,86 @@ api_jobs_get_nfo(struct MHD_Connection *conn, const char *id) {
   return json_respond(conn, MHD_HTTP_OK, body);
 }
 
+/* True if fname (a basename) is listed in selected (a cJSON array of
+ * strings), or selected is NULL -- no filter provided means "everything
+ * found", the pre-checkbox-modal behavior. */
+static int
+pkg_filename_selected(const char *fname, const cJSON *selected) {
+  const cJSON *item;
+
+  if (!selected) return 1;
+
+  cJSON_ArrayForEach(item, selected) {
+    if (cJSON_IsString(item) && !strcmp(item->valuestring, fname)) return 1;
+  }
+  return 0;
+}
+
+enum MHD_Result
+api_jobs_install_pkgs(struct MHD_Connection *conn, const char *id, const char *body, size_t body_len) {
+  job_t *job;
+  char paths[JOB_MAX_PKGS][900];
+  size_t count = 0, i;
+  cJSON *results;
+  cJSON *req_root = NULL, *req_files = NULL;
+
+  if (body && body_len > 0 && (req_root = cJSON_ParseWithLength(body, body_len))) {
+    req_files = cJSON_GetObjectItemCaseSensitive(req_root, "files");
+    if (!cJSON_IsArray(req_files)) req_files = NULL;
+  }
+
+  queue_lock();
+  job = queue_find_job(g_app.queue, id);
+  if (job) {
+    job_ensure_pkg_scanned(job);
+    for (i = 0; i < job->pkg_count; i++) {
+      const char *fname = strrchr(job->pkg_paths[i], '/');
+
+      fname = fname ? fname + 1 : job->pkg_paths[i];
+      if (!pkg_filename_selected(fname, req_files)) continue;
+
+      snprintf(paths[count], sizeof paths[count], "%s", job->pkg_paths[i]);
+      count++;
+    }
+  }
+  queue_unlock();
+
+  cJSON_Delete(req_root);
+
+  if (!job) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no such job");
+  if (count == 0) return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "no matching .pkg files found for this job");
+
+  /* Installs run without queue_lock held -- sceAppInstUtilInstallByPackage()
+   * is a blocking system call, same reasoning as api_jobs_get_nfo() reading
+   * the .nfo file off the lock. */
+  results = cJSON_CreateArray();
+  for (i = 0; i < count; i++) {
+    const char *fname = strrchr(paths[i], '/');
+    char err[256] = "";
+    cJSON *r = cJSON_CreateObject();
+    int ok;
+
+    fname = fname ? fname + 1 : paths[i];
+    ok = pkg_install_file(paths[i], err, sizeof err) == 0;
+
+    if (ok) log_info("[%s] api_jobs: installed %s", id, paths[i]);
+    else log_warn("[%s] api_jobs: install failed for %s: %s", id, paths[i], err);
+
+    cJSON_AddStringToObject(r, "filename", fname);
+    cJSON_AddBoolToObject(r, "installed", ok);
+    if (!ok) cJSON_AddStringToObject(r, "error", err);
+    cJSON_AddItemToArray(results, r);
+  }
+
+  return json_respond(conn, MHD_HTTP_OK, results);
+}
+
 /* Writes the uploaded NZB to a scratch file so nzb_parse_file() (which
  * streams from disk) doesn't need a second in-memory copy of it. */
 enum MHD_Result
 api_jobs_create(struct MHD_Connection *conn, const unsigned char *nzb_data,
                 size_t nzb_len, const char *nzb_filename, const char *display_name,
-                const char *output_dir, int add_to_shadowmount) {
+                const char *output_dir, int add_to_shadowmount, int auto_install_pkgs) {
   char scratch_dir[600], scratch_path[768];
   unsigned char rand_bytes[8];
   char rand_hex[17];
@@ -292,6 +369,7 @@ api_jobs_create(struct MHD_Connection *conn, const unsigned char *nzb_data,
     snprintf(job->output_dir, sizeof job->output_dir, "%s", output_dir);
   }
   job->add_to_shadowmount = add_to_shadowmount;
+  job->auto_install_pkgs = auto_install_pkgs;
 
   queue_lock();
   if (queue_add_job(g_app.queue, job) < 0) {

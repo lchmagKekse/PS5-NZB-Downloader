@@ -25,6 +25,7 @@
 #define DISPLAY_NAME_FIELD_NAME "display_name"
 #define OUTPUT_DIR_FIELD_NAME "output_dir"
 #define ADD_SHADOWMOUNT_FIELD_NAME "add_to_shadowmount"
+#define AUTO_INSTALL_PKGS_FIELD_NAME "auto_install_pkgs"
 
 typedef struct {
   int   is_multipart;
@@ -44,6 +45,7 @@ typedef struct {
   char           display_name[256];  /* rename-on-add modal's confirmed name */
   char           output_dir[512];    /* add-NZB modal's "Output folder" input */
   int            add_to_shadowmount; /* "1" if the modal's checkbox was checked */
+  int            auto_install_pkgs;  /* "1" if the modal's "Auto-install PKGs" checkbox was checked */
 } conn_ctx_t;
 
 static volatile int g_stop = 0;
@@ -99,6 +101,11 @@ upload_iterator(void *cls, enum MHD_ValueKind kind, const char *key,
 
   if (!strcmp(key, ADD_SHADOWMOUNT_FIELD_NAME)) {
     if (off == 0 && size > 0) ctx->add_to_shadowmount = (value[0] == '1');
+    return MHD_YES;
+  }
+
+  if (!strcmp(key, AUTO_INSTALL_PKGS_FIELD_NAME)) {
+    if (off == 0 && size > 0) ctx->auto_install_pkgs = (value[0] == '1');
     return MHD_YES;
   }
 
@@ -175,7 +182,8 @@ route_post(struct MHD_Connection *conn, const char *url, conn_ctx_t *ctx) {
                                  "missing '" UPLOAD_FIELD_NAME "' file field");
     }
     return api_jobs_create(conn, ctx->upload_data, ctx->upload_len, ctx->upload_filename,
-                            ctx->display_name, ctx->output_dir, ctx->add_to_shadowmount);
+                            ctx->display_name, ctx->output_dir, ctx->add_to_shadowmount,
+                            ctx->auto_install_pkgs);
   }
 
   if (!strcmp(url, "/api/config")) {
@@ -198,6 +206,7 @@ route_post(struct MHD_Connection *conn, const char *url, conn_ctx_t *ctx) {
     if (!strcmp(action, "resume")) return api_jobs_resume(conn, id);
     if (!strcmp(action, "cancel")) return api_jobs_cancel(conn, id);
     if (!strcmp(action, "retry"))  return api_jobs_retry(conn, id);
+    if (!strcmp(action, "install-pkgs")) return api_jobs_install_pkgs(conn, id, ctx->raw_body, ctx->raw_body_len);
 
     return json_respond_error(conn, MHD_HTTP_NOT_FOUND, "unknown job action");
   }

@@ -232,6 +232,10 @@ table td, table th { background: transparent; }
   border-radius: var(--pico-border-radius);
   margin: 0;
 }
+/* nfo.svg/pkg.svg (main.js's jobActionButtons()) are plain <img>, not
+ * fa-solid <i> glyphs like every other icon-btn here -- sized to match
+ * those visually since they sit in the same button row. */
+.icon-btn img { width: 1.15rem; height: 1.15rem; }
 /* Persistent styling: every icon button stays solid-filled with a white
  * icon always, danger (cancel/remove) included -- just red instead of
  * primary-blue, same as pause/resume/retry are (Pico's default button
@@ -418,6 +422,10 @@ table td, table th { background: transparent; }
  * same full spacing twice in a row. */
 #rename-modal small { display: block; margin: -.5rem 0 1rem; }
 #rename-modal .shadowmount-row { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
+
+.pkg-install-list { max-height: 40vh; overflow: auto; }
+.pkg-install-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .75rem; }
+.pkg-install-row input { margin: 0; }
 
 #nfo-modal article { width: 90vw; max-width: 60rem; }
 .nfo-viewer {
