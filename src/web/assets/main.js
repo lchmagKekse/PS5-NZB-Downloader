@@ -37,18 +37,46 @@ function formatSpeed(bytesPerSec) {
   return formatBytes(bytesPerSec) + '/s';
 }
 
-function formatEta(job) {
-  const p = job.progress;
-  if (!p || p.total_bytes <= 0) return '-';
-  const remaining = p.total_bytes - p.downloaded_bytes;
-  if (remaining <= 0) return '-';
-  const speed = window.__lastSpeed || 0;
-  if (speed <= 0) return '-';
-  let secs = Math.round(remaining / speed);
+function formatDuration(secs) {
+  secs = Math.round(secs);
   const h = Math.floor(secs / 3600); secs -= h * 3600;
   const m = Math.floor(secs / 60); secs -= m * 60;
-  return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + secs + 's';
+  return (h ? h + 'h ' : '') + (m || h ? m + 'm ' : '') + secs + 's';
 }
+
+const _etaSamples = new Map();
+
+function estimateEtaSecs(jobId, phase, done, total) {
+  const now = Date.now();
+  const remaining = total - done;
+  if (!jobId || total <= 0 || remaining <= 0) {
+    if (jobId) _etaSamples.delete(jobId);
+    return null;
+  }
+
+  const prev = _etaSamples.get(jobId);
+  let rate = null;
+  if (prev && prev.phase === phase && done >= prev.done) {
+    const dt = (now - prev.time) / 1000;
+    if (dt > 0.5) {
+      const instantRate = (done - prev.done) / dt;
+      /* Exponential moving average smooths out the per-poll jitter that a
+       * raw two-sample rate would otherwise show. */
+      rate = prev.rate != null ? (prev.rate * 0.7 + instantRate * 0.3) : instantRate;
+    } else {
+      rate = prev.rate;
+    }
+  }
+
+  _etaSamples.set(jobId, { phase, done, time: now, rate });
+  return rate > 0 ? remaining / rate : null;
+}
+
+/* States where bytes are actually being processed right now, so a "current
+ * stage" ETA makes sense -- e.g. while paused, done/total just sit frozen,
+ * and estimateEtaSecs's rate would decay toward (but never quite reach)
+ * zero across polls, making the ETA climb instead of disappearing. */
+const ETA_ACTIVE_STATES = ['downloading', 'verifying', 'repairing', 'extracting'];
 
 /* Centralizes the "which phase is this job in, and what bytes/pct go with
  * it" logic shared by the dashboard table and the job detail page -- the
@@ -56,19 +84,28 @@ function formatEta(job) {
  * itself but also for whichever of verify/repair/extract is currently
  * running (see job_json.c's progress_json()), so the progress bar can
  * show real numbers ("4.3 GB / 12 GB") through every phase, not just
- * while downloading. */
-function jobProgressInfo(p) {
-  let done = 0, total = 0;
+ * while downloading. jobId/state are optional and only needed to estimate
+ * an ETA for the current phase (see estimateEtaSecs above). */
+function jobProgressInfo(p, jobId, state) {
+  let done = 0, total = 0, phase = 'downloading';
 
-  if (p && p.extracting) { done = p.extract_bytes_done; total = p.extract_bytes_total; }
-  else if (p && p.repairing) { done = p.repair_bytes_done; total = p.repair_bytes_total; }
-  else if (p && p.verifying) { done = p.verify_bytes_done; total = p.verify_bytes_total; }
+  if (p && p.extracting) { phase = 'extracting'; done = p.extract_bytes_done; total = p.extract_bytes_total; }
+  else if (p && p.repairing) { phase = 'repairing'; done = p.repair_bytes_done; total = p.repair_bytes_total; }
+  else if (p && p.verifying) { phase = 'verifying'; done = p.verify_bytes_done; total = p.verify_bytes_total; }
   else { done = (p && p.downloaded_bytes) || 0; total = (p && p.total_bytes) || 0; }
 
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const label = formatBytes(done) + ' / ' + formatBytes(total);
 
-  return { pct, done, total, label };
+  let eta = null;
+  if (jobId && ETA_ACTIVE_STATES.includes(state)) {
+    const etaSecs = estimateEtaSecs(jobId, phase, done, total);
+    eta = etaSecs != null ? formatDuration(etaSecs) : null;
+  } else if (jobId) {
+    _etaSamples.delete(jobId);
+  }
+
+  return { pct, done, total, label, eta };
 }
 
 function escapeHtml(s) {
@@ -132,10 +169,11 @@ function stateBadge(state) {
 }
 
 function progressBarHtml(job) {
-  const info = jobProgressInfo(job.progress);
+  const info = jobProgressInfo(job.progress, job.id, job.state);
+  const etaPart = info.eta ? ` - ${info.eta}` : '';
   return `
     <progress value="${info.pct}" max="100"></progress>
-    <span class="progress-label">${info.label} (${info.pct}%)</span>
+    <span class="progress-label">${info.label} (${info.pct}%)${etaPart}</span>
   `;
 }
 

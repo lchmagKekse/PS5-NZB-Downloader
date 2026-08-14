@@ -155,7 +155,6 @@ function renderJobRows(jobs) {
 async function refresh() {
   try {
     const status = await apiGet('/api/status');
-    window.__lastSpeed = status.download_speed_bytes_per_sec;
 
     document.getElementById('stat-speed').textContent = formatSpeed(status.download_speed_bytes_per_sec);
     document.getElementById('stat-conns').textContent = status.active_connections + ' / ' + status.max_connections;

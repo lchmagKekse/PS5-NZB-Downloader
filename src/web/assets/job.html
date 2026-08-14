@@ -58,14 +58,14 @@ async function refresh() {
     return;
   }
 
-  const info = jobProgressInfo(job.progress);
+  const info = jobProgressInfo(job.progress, job.id, job.state);
   document.getElementById('job-header').innerHTML = `
     <h2 style="margin-top:0;">${escapeHtml(job.name)}</h2>
     <div class="stats-grid">
       <div class="stat"><div class="label">State</div><div class="value">${stateBadge(job.state)}</div></div>
       <div class="stat"><div class="label">Progress</div><div class="value">${info.pct}%</div></div>
+      <div class="stat"><div class="label">ETA</div><div class="value">${info.eta || '-'}</div></div>
       <div class="stat"><div class="label">Size</div><div class="value">${formatBytes(job.progress.total_bytes)}</div></div>
-      <div class="stat"><div class="label">Retries</div><div class="value">${job.retries_used}</div></div>
     </div>
     <div style="margin-top:12px;">${progressBarHtml(job)}</div>
     ${job.output_dir ? `<p class="muted" style="margin-top:12px;">${escapeHtml(job.output_dir)}/${escapeHtml(job.name)}</p>` : ''}
