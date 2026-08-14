@@ -12,7 +12,7 @@
 <body>
 <header class="site-header">
   <nav class="container-fluid">
-    <ul><li class="brand"><strong><img src="/favicon.svg" alt="" class="brand-icon"> PS5 NZB Downloader</strong><span class="version-tag">v0.1.0</span></li></ul>
+    <ul><li class="brand"><strong><img src="/favicon.svg" alt="" class="brand-icon"> PS5 NZB Downloader</strong><span class="version-tag">v0.1.1</span></li></ul>
     <ul>
       <li><a href="/settings.html" class="icon-link" title="Settings" aria-label="Settings"><i class="fa-solid fa-gear fa-lg"></i></a></li>
     </ul>
@@ -87,25 +87,69 @@
 
 <script src="/main.js"></script>
 <script>
-/* Not a terminal state -- still queued, actively downloading, or in one
- * of the post-download phases. This is what "Queue" counts, same set the
- * old separate "Active jobs" tile drew from (see api_status.c's
- * active_jobs, JOB_DOWNLOADING/VERIFYING/EXTRACTING) but broader --
- * queued and paused jobs are just as much "up for downloading" as ones
- * currently mid-transfer, so that tile is gone and this replaces it. */
+  
 const PENDING_STATES = ['queued', 'downloading', 'paused', 'verifying', 'repairing', 'extracting'];
-
-/* The queue API returns jobs oldest-added-first (queue_add_job() appends,
- * see src/queue/queue.c) -- that order also drives actual download
- * priority, so it isn't something the frontend should touch. Display order
- * is a separate concern: reverse to put the most recently added job on
- * top, then stable-partition so completed jobs always sink below every
- * still-active one regardless of age. */
+const JOB_DISPLAY_STATE_RANK = {
+  verifying: 0, repairing: 0, extracting: 0,
+  downloading: 1,
+  queued: 2,
+  paused: 3,
+  failed: 4, cancelled: 4,
+  completed: 5,
+};
 function sortJobsForDisplay(jobs) {
-  const newestFirst = [...jobs].reverse();
-  const active = newestFirst.filter(j => j.state !== 'completed');
-  const completed = newestFirst.filter(j => j.state === 'completed');
-  return [...active, ...completed];
+  return jobs.sort((a, b) =>
+    (JOB_DISPLAY_STATE_RANK[a.state] ?? 99) - (JOB_DISPLAY_STATE_RANK[b.state] ?? 99));
+}
+
+function jobRowCells(j) {
+  return `
+    <td data-label="Name"><a href="/job.html?id=${encodeURIComponent(j.id)}">${escapeHtml(j.name)}</a></td>
+    <td data-label="State">${stateBadge(j.state)}</td>
+    <td data-label="Progress">${progressBarHtml(j)}</td>
+    <td data-label="Size">${formatBytes(j.progress.total_bytes)}</td>
+    <td data-label="Actions">${jobActionButtons(j)}</td>`;
+}
+
+function renderJobRows(jobs) {
+  const rows = document.getElementById('job-rows');
+  const sorted = sortJobsForDisplay(jobs);
+
+  if (!sorted.length) {
+    rows.innerHTML = '<tr><td colspan="5" class="muted">Queue is empty</td></tr>';
+    return;
+  }
+
+  Array.from(rows.children).forEach(tr => { if (!tr.dataset.jobId) tr.remove(); });
+
+  const existing = new Map();
+  rows.querySelectorAll('tr[data-job-id]').forEach(tr => existing.set(tr.dataset.jobId, tr));
+
+  let prev = null;
+  for (const j of sorted) {
+    let tr = existing.get(j.id);
+    if (tr) {
+      existing.delete(j.id);
+      if (tr.dataset.state !== j.state) {
+        tr.innerHTML = jobRowCells(j);
+        tr.dataset.state = j.state;
+      } else {
+        tr.children[2].innerHTML = progressBarHtml(j);
+        tr.children[3].textContent = formatBytes(j.progress.total_bytes);
+      }
+    } else {
+      tr = document.createElement('tr');
+      tr.dataset.jobId = j.id;
+      tr.dataset.state = j.state;
+      tr.innerHTML = jobRowCells(j);
+    }
+
+    const ref = prev ? prev.nextSibling : rows.firstChild;
+    if (ref !== tr) rows.insertBefore(tr, ref);
+    prev = tr;
+  }
+
+  existing.forEach(tr => tr.remove());
 }
 
 async function refresh() {
@@ -119,18 +163,7 @@ async function refresh() {
     const jobs = await apiGet('/api/jobs');
     document.getElementById('stat-queue').textContent = jobs.filter(j => PENDING_STATES.includes(j.state)).length;
 
-    const rows = document.getElementById('job-rows');
-    if (!jobs.length) {
-      rows.innerHTML = '<tr><td colspan="5" class="muted">Queue is empty</td></tr>';
-    } else {
-      rows.innerHTML = sortJobsForDisplay(jobs).map(j => `<tr>
-          <td data-label="Name"><a href="/job.html?id=${encodeURIComponent(j.id)}">${escapeHtml(j.name)}</a></td>
-          <td data-label="State">${stateBadge(j.state)}</td>
-          <td data-label="Progress">${progressBarHtml(j)}</td>
-          <td data-label="Size">${formatBytes(j.progress.total_bytes)}</td>
-          <td data-label="Actions">${jobActionButtons(j)}</td>
-        </tr>`).join('');
-    }
+    renderJobRows(jobs);
   } catch (e) {
     console.error(e);
   }
