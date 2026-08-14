@@ -20,6 +20,14 @@
  * nntp_conn.c's RBUF_SIZE. */
 #define ARCHIVE_READ_BLOCK_SIZE (256 * 1024)
 
+/* copy_data() coalesces writes up to this size before issuing a
+ * write() (see write_buf_t). Bigger than ARCHIVE_READ_BLOCK_SIZE on
+ * purpose: for a genuinely-compressed entry (real RAR/7z compression, not
+ * "stored"), libarchive's decompressor hands back blocks far smaller than
+ * the 256KB read block -- often tens of KB -- which without coalescing
+ * means a write() syscall per small block instead of per read. */
+#define WRITE_COALESCE_SIZE (1024 * 1024)
+
 typedef enum {
   AKIND_RAR,
   AKIND_SEVENZ,
@@ -183,9 +191,34 @@ is_safe_relpath(const char *p) {
   return 1;
 }
 
+/* Accumulates contiguous blocks from archive_read_data_block() up to
+ * WRITE_COALESCE_SIZE before issuing a single archive_write_data_block()
+ * -- see copy_data(). Reused across every entry of one extract_one_archive()
+ * call (allocated once, not per-entry). */
+typedef struct {
+  char *buf;
+  size_t cap;
+  size_t len;
+  la_int64_t offset;  /* file offset that buf[0] belongs at, valid iff len > 0 */
+} write_buf_t;
+
 static int
-copy_data(struct archive *ar, struct archive *aw, const char *display_name, const char *job_id,
-          la_int64_t entry_size, progress_t *pg, char *err, size_t err_size) {
+write_buf_flush(struct archive *aw, write_buf_t *wb, const char *display_name,
+                 la_int64_t copied, la_int64_t entry_size, char *err, size_t err_size) {
+  if (wb->len == 0) return 0;
+
+  if (archive_write_data_block(aw, wb->buf, wb->len, wb->offset) != ARCHIVE_OK) {
+    snprintf(err, err_size, "%s: write error after %lld/%lld bytes: %s",
+             display_name, (long long)copied, (long long)entry_size, archive_error_string(aw));
+    return -1;
+  }
+  wb->len = 0;
+  return 0;
+}
+
+static int
+copy_data(struct archive *ar, struct archive *aw, write_buf_t *wb, const char *display_name,
+          const char *job_id, la_int64_t entry_size, progress_t *pg, char *err, size_t err_size) {
   la_int64_t copied = 0;
 
   for (;;) {
@@ -194,7 +227,7 @@ copy_data(struct archive *ar, struct archive *aw, const char *display_name, cons
     la_int64_t offset;
     int r = archive_read_data_block(ar, &buff, &size, &offset);
 
-    if (r == ARCHIVE_EOF) return 0;
+    if (r == ARCHIVE_EOF) return write_buf_flush(aw, wb, display_name, copied, entry_size, err, err_size);
     if (r != ARCHIVE_OK) {
       if (r == ARCHIVE_WARN) {
         log_warn("[%s] extract: %s: %s (after %lld/%lld bytes, %.1f%%)", job_id, display_name,
@@ -211,10 +244,30 @@ copy_data(struct archive *ar, struct archive *aw, const char *display_name, cons
       }
     }
 
-    if (archive_write_data_block(aw, buff, size, offset) != ARCHIVE_OK) {
-      snprintf(err, err_size, "%s: write error after %lld/%lld bytes: %s",
-               display_name, (long long)copied, (long long)entry_size, archive_error_string(aw));
-      return -1;
+    /* A non-contiguous block (sparse entry) can't be appended to whatever
+     * is already buffered -- flush it first so the write offset stays
+     * correct. */
+    if (wb->len > 0 && offset != wb->offset + (la_int64_t)wb->len) {
+      if (write_buf_flush(aw, wb, display_name, copied, entry_size, err, err_size) < 0) return -1;
+    }
+
+    if (size >= wb->cap) {
+      /* Bigger than the whole coalescing buffer (e.g. a "stored" entry
+       * handing back a full 256KB read block) -- write it straight
+       * through instead of copying it into wb first. */
+      if (write_buf_flush(aw, wb, display_name, copied, entry_size, err, err_size) < 0) return -1;
+      if (archive_write_data_block(aw, buff, size, offset) != ARCHIVE_OK) {
+        snprintf(err, err_size, "%s: write error after %lld/%lld bytes: %s",
+                 display_name, (long long)copied, (long long)entry_size, archive_error_string(aw));
+        return -1;
+      }
+    } else {
+      if (wb->len + size > wb->cap) {
+        if (write_buf_flush(aw, wb, display_name, copied, entry_size, err, err_size) < 0) return -1;
+      }
+      if (wb->len == 0) wb->offset = offset;
+      memcpy(wb->buf + wb->len, buff, size);
+      wb->len += size;
     }
 
     copied += (la_int64_t)size;
@@ -289,58 +342,75 @@ extract_one_archive(const char **volumes, const char *dest_dir, const job_t *job
       ARCHIVE_EXTRACT_PERM | ARCHIVE_EXTRACT_SECURE_NODOTDOT);
   archive_write_disk_set_standard_lookup(ext);
 
-  for (;;) {
-    struct archive_entry *entry;
-    const char *entry_path;
-    char full_path[1200];
-    int r = archive_read_next_header(a, &entry);
+  {
+    write_buf_t wb = {0};
 
-    if (r == ARCHIVE_EOF) break;
-    if (r == ARCHIVE_WARN) {
-      log_warn("[%s] extract: %s: %s", job->id, display, archive_error_string(a));
-    } else if (r != ARCHIVE_OK) {
-      snprintf(err, err_size, "%s: %s", display, archive_error_string(a));
-      rc = -1;
-      break;
+    if (!(wb.buf = malloc(WRITE_COALESCE_SIZE))) {
+      snprintf(err, err_size, "out of memory");
+      archive_write_close(ext);
+      archive_write_free(ext);
+      archive_read_close(a);
+      archive_read_free(a);
+      rar5_stream_free(rar5_ctx);
+      return -1;
+    }
+    wb.cap = WRITE_COALESCE_SIZE;
+
+    for (;;) {
+      struct archive_entry *entry;
+      const char *entry_path;
+      char full_path[1200];
+      int r = archive_read_next_header(a, &entry);
+
+      if (r == ARCHIVE_EOF) break;
+      if (r == ARCHIVE_WARN) {
+        log_warn("[%s] extract: %s: %s", job->id, display, archive_error_string(a));
+      } else if (r != ARCHIVE_OK) {
+        snprintf(err, err_size, "%s: %s", display, archive_error_string(a));
+        rc = -1;
+        break;
+      }
+
+      entries_seen++;
+
+      entry_path = archive_entry_pathname(entry);
+      if (!is_safe_relpath(entry_path)) {
+        log_warn("[%s] extract: %s: skipping entry with unsafe path '%s'",
+                 job->id, display, entry_path ? entry_path : "(null)");
+        continue;
+      }
+
+      snprintf(full_path, sizeof full_path, "%s/%s", dest_dir, entry_path);
+      archive_entry_set_pathname(entry, full_path);
+
+      r = archive_write_header(ext, entry);
+      if (r == ARCHIVE_WARN) {
+        log_warn("[%s] extract: %s: %s", job->id, full_path, archive_error_string(ext));
+      } else if (r != ARCHIVE_OK) {
+        log_warn("[%s] extract: %s: %s - skipping this entry", job->id, full_path, archive_error_string(ext));
+        continue;
+      }
+
+      if (archive_entry_size(entry) > 0 &&
+          copy_data(a, ext, &wb, full_path, job->id, archive_entry_size(entry), pg, err, err_size) < 0) {
+        rc = -1;
+        break;
+      }
+
+      if (archive_write_finish_entry(ext) != ARCHIVE_OK) {
+        log_warn("[%s] extract: %s: %s", job->id, full_path, archive_error_string(ext));
+      }
+
+      /* Force 0777 on every entry, overriding ARCHIVE_EXTRACT_PERM: archived
+       * PS5 homebrew ELFs often arrive without the executable bit set. */
+      if (chmod(full_path, 0777) != 0) {
+        log_warn("[%s] extract: chmod(%s, 0777): %s", job->id, full_path, strerror(errno));
+      }
+
+      entries_written++;
     }
 
-    entries_seen++;
-
-    entry_path = archive_entry_pathname(entry);
-    if (!is_safe_relpath(entry_path)) {
-      log_warn("[%s] extract: %s: skipping entry with unsafe path '%s'",
-               job->id, display, entry_path ? entry_path : "(null)");
-      continue;
-    }
-
-    snprintf(full_path, sizeof full_path, "%s/%s", dest_dir, entry_path);
-    archive_entry_set_pathname(entry, full_path);
-
-    r = archive_write_header(ext, entry);
-    if (r == ARCHIVE_WARN) {
-      log_warn("[%s] extract: %s: %s", job->id, full_path, archive_error_string(ext));
-    } else if (r != ARCHIVE_OK) {
-      log_warn("[%s] extract: %s: %s - skipping this entry", job->id, full_path, archive_error_string(ext));
-      continue;
-    }
-
-    if (archive_entry_size(entry) > 0 &&
-        copy_data(a, ext, full_path, job->id, archive_entry_size(entry), pg, err, err_size) < 0) {
-      rc = -1;
-      break;
-    }
-
-    if (archive_write_finish_entry(ext) != ARCHIVE_OK) {
-      log_warn("[%s] extract: %s: %s", job->id, full_path, archive_error_string(ext));
-    }
-
-    /* Force 0777 on every entry, overriding ARCHIVE_EXTRACT_PERM: archived
-     * PS5 homebrew ELFs often arrive without the executable bit set. */
-    if (chmod(full_path, 0777) != 0) {
-      log_warn("[%s] extract: chmod(%s, 0777): %s", job->id, full_path, strerror(errno));
-    }
-
-    entries_written++;
+    free(wb.buf);
   }
 
   archive_write_close(ext);
