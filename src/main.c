@@ -23,9 +23,9 @@
 #include "web/httpd.h"
 #include "yenc/yenc.h"
 
-#define DEFAULT_CONFIG_PATH "/data/nzb/nzb.conf"
-#define DEFAULT_QUEUE_DIR   "/data/nzb/queue"
-#define DEFAULT_LOG_PATH    "/data/nzb/nzb.log"
+#define DEFAULT_CONFIG_PATH "/data/nzb-downloader/nzb.conf"
+#define DEFAULT_QUEUE_DIR   "/data/nzb-downloader/queue"
+#define DEFAULT_LOG_PATH    "/data/nzb-downloader/nzb.log"
 #define HTTP_PORT 4202
 
 static void

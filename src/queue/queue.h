@@ -42,11 +42,28 @@ job_t *queue_find_next_queued(queue_t *q);
  * either way -- caller must not use it afterward). */
 int queue_add_job(queue_t *q, job_t *job);
 
-/* Re-persists a job's current in-memory state to disk. Call after
+/* Re-persists a job's header (state, priority, error, output settings,
+ * etc -- see job.c's format comment for why that excludes its
+ * file/segment structure and download progress) to disk. Call after
  * mutating a job returned by queue_find_job()/queue_add_job() (e.g.
- * job_set_state(), job_mark_segment_downloaded()) so progress survives a
- * restart. Returns 0 on success, -1 on failure. */
+ * job_set_state()) so it survives a restart. O(1) in job size regardless
+ * of segment count. Returns 0 on success, -1 on failure. */
 int queue_save_job(queue_t *q, const job_t *job);
+
+/* Split save for a job's download-progress bitmap specifically (see
+ * job.c's format comment), for a caller -- download.c's per-job
+ * checkpoint, the reason this exists -- in a position to release
+ * queue_lock between the two halves: call queue_job_progress_snapshot()
+ * while still holding it (fast, in-memory), release it, then
+ * queue_write_job_progress() with the result, which does the actual disk
+ * write and needs no lock at all. Call this instead of queue_save_job()
+ * on every segment completion; queue_save_job() only needs calling on
+ * actual state changes. queue_job_progress_snapshot() returns NULL on
+ * failure (already logged); pass anything else straight to
+ * queue_write_job_progress(), which always frees bitmap and returns 0/-1
+ * (already logged). */
+unsigned char *queue_job_progress_snapshot(const job_t *job, size_t *out_len);
+int queue_write_job_progress(queue_t *q, const job_t *job, unsigned char *bitmap, size_t len);
 
 /* State-changing conveniences. Each validates the job is in a state the
  * operation makes sense from, updates it, persists it, and returns 0 on

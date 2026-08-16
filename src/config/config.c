@@ -38,7 +38,7 @@ app_config_set_defaults(app_config_t *cfg) {
    * are app working state, not the large final media output_dir holds, which
    * stays on external storage /mnt/usb0. */
   snprintf(cfg->storage.output_dir, sizeof cfg->storage.output_dir, "%s", "/data/games");
-  snprintf(cfg->storage.temp_dir,   sizeof cfg->storage.temp_dir,   "%s", "/data/nzb/incomplete");
+  snprintf(cfg->storage.temp_dir,   sizeof cfg->storage.temp_dir,   "%s", "/data/nzb-downloader/incomplete");
 }
 
 static void

@@ -108,9 +108,9 @@ ps5_nzb_downloader.elf: $(APP_SRCS) src/main.c $(GEN_SRCS)
 clean:
 	rm -rf ps5_nzb_downloader.elf gen
 
-# Streams the ELF over the socket. Reads /data/nzb/nzb.conf (or argv[1]
-# -- but the streamed-ELF deploy path gives no argv), serves the web UI
-# on port 4202 (see main.c's HTTP_PORT).
+# Streams the ELF over the socket. Reads /data/nzb-downloader/nzb.conf (or
+# argv[1] -- but the streamed-ELF deploy path gives no argv), serves the
+# web UI on port 4202 (see main.c's HTTP_PORT).
 test-nzb: ps5_nzb_downloader.elf
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
 

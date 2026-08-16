@@ -1,8 +1,10 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "../log/log.h"
@@ -27,18 +29,20 @@ job_state_name(job_state_t state) {
   return "unknown";
 }
 
+/* 6 random bytes as 12 lowercase hex chars -- not a real UUID (no
+ * version/variant bits to set), just a short, filesystem-safe token used
+ * as the job's id everywhere: <id>.json/.segments/.progress filenames,
+ * API URLs, log lines. 48 bits of entropy is effectively collision-free
+ * at the scale a personal download queue ever reaches (a UUID's 122 bits
+ * was always far more than this needed). */
 static void
 generate_job_id(char out[JOB_ID_LEN]) {
-  unsigned char b[16];
+  unsigned char b[6];
 
   arc4random_buf(b, sizeof b);
-  b[6] = (b[6] & 0x0F) | 0x40; /* version 4 */
-  b[8] = (b[8] & 0x3F) | 0x80; /* variant 10xx */
 
-  snprintf(out, JOB_ID_LEN,
-           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+  snprintf(out, JOB_ID_LEN, "%02x%02x%02x%02x%02x%02x",
+           b[0], b[1], b[2], b[3], b[4], b[5]);
 }
 
 job_t *
@@ -136,6 +140,12 @@ job_add_pkg_path(job_t *job, const char *path) {
 
 void
 job_set_state(job_t *job, job_state_t state) {
+  /* Same state as already set -- skip the log line and notify() below
+   * instead of recording (and pushing) a no-op "X -> X" transition. Every
+   * call site is expected to already know it's changing state, but this
+   * guards against a future one that doesn't bother checking first. */
+  if (job->state == state) return;
+
   log_info("[%s] state %s -> %s", job->id, job_state_name(job->state), job_state_name(state));
   job->state = state;
 
@@ -170,12 +180,52 @@ job_mark_segment_downloaded(job_t *job, const char *message_id) {
   return 0;
 }
 
+int
+job_file_is_par2_volume(const char *name) {
+  size_t len = strlen(name);
+  const char *p, *digits_end;
+
+  if (len < 5 || strcasecmp(name + len - 5, ".par2") != 0) return 0;
+  len -= 5; /* everything up to ".par2" */
+
+  /* Walk back over "MMM" (block count), '+', then "NNN" (start index) --
+   * scanning from the known ".par2" suffix rather than forward-searching
+   * for ".vol" so a filename that happens to contain "vol" earlier (or in
+   * different case) can't produce a false match. */
+  p = digits_end = name + len;
+  while (p > name && p[-1] >= '0' && p[-1] <= '9') p--;
+  if (p == digits_end || p == name || p[-1] != '+') return 0;
+  p--;
+
+  digits_end = p;
+  while (p > name && p[-1] >= '0' && p[-1] <= '9') p--;
+  if (p == digits_end) return 0;
+
+  return (size_t)(p - name) >= 4 && !strncasecmp(p - 4, ".vol", 4);
+}
+
 void
 job_segment_progress(const job_t *job, size_t *total, size_t *downloaded) {
   size_t fi, si, t = 0, d = 0;
 
   for (fi = 0; fi < job->file_count; fi++) {
     const job_file_t *f = &job->files[fi];
+
+    /* A recovery volume download.c hasn't fetched yet (see its two-phase
+     * download: volumes are skipped unless PAR2 verify actually finds
+     * damage) shouldn't count against progress -- otherwise the job looks
+     * permanently stuck below 100% for bytes it was never going to need.
+     * Once any segment of a volume has been fetched (repair was needed),
+     * count that file normally so the recovery-fetch itself is visible. */
+    if (job_file_is_par2_volume(f->filename)) {
+      int touched = 0;
+
+      for (si = 0; si < f->segment_count; si++) {
+        if (f->segments[si].downloaded) { touched = 1; break; }
+      }
+      if (!touched) continue;
+    }
+
     for (si = 0; si < f->segment_count; si++) {
       t++;
       if (f->segments[si].downloaded) d++;
@@ -200,43 +250,135 @@ job_state_from_name(const char *s) {
   return JOB_QUEUED;
 }
 
-int
-job_save(const job_t *job, const char *path) {
-  cJSON *root = cJSON_CreateObject();
-  cJSON *files = cJSON_CreateArray();
-  char tmp_path[600];
+/* A job is persisted as up to three sibling files, deliberately not all
+ * named "*.json" -- queue.c's startup scan globs "*.json" for job headers,
+ * and a sidecar matching that glob would get mistaken for one:
+ *   "<id>.json"     -- the header: state, priority, error, output
+ *     settings, etc. Nothing here scales with segment count.
+ *   "<id>.segments" -- the file/segment structure: filenames, subjects,
+ *     message-ids, sizes -- everything job_add_file()/job_file_add_segment()
+ *     fill in from the NZB. Fixed at parse time and never mutated again by
+ *     any code path afterward (see job_ensure_segments_saved()'s comment),
+ *     so unlike the header this is written once and never rewritten.
+ *   "<id>.progress" -- a raw bitmap, one bit per segment in the same
+ *     file/segment order as ".segments", set once that segment's article
+ *     is fetched (job_mark_segment_downloaded()). The only thing that
+ *     changes on every segment completion, so it's the only thing
+ *     download.c's per-job checkpoint has to rewrite there -- at most a
+ *     couple hundred KB even for a job with a million segments, instead of
+ *     the 100+ MB a full "rewrite everything" checkpoint meant for one
+ *     that size (message-ids alone dominate that cost, and never change).
+ * Splitting the always-changing bit (progress) from the write-once bit
+ * (segments) from the small-and-occasionally-changing bit (header) is
+ * this project's answer to the same problem tools like SABnzbd solve by
+ * not re-persisting a job's full per-article state on every single
+ * article -- the article list itself is derived once from the NZB and
+ * doesn't need saving again; only "which of these did we get" changes,
+ * and that's cheap to represent compactly. */
+void
+job_sidecar_path(const char *json_path, const char *suffix, char *out, size_t out_size) {
+  size_t len = strlen(json_path);
+  static const char ext[] = ".json";
+  size_t ext_len = sizeof ext - 1;
+
+  if (len >= ext_len && !strcmp(json_path + len - ext_len, ext)) {
+    snprintf(out, out_size, "%.*s%s", (int)(len - ext_len), json_path, suffix);
+  } else {
+    snprintf(out, out_size, "%s%s", json_path, suffix);
+  }
+}
+
+/* Serializes disk writes across every job_write_file() call (any job, any
+ * of its sidecars) so two concurrent saves can never interleave writes to
+ * -- or race the fopen("w")/rename() of -- the same path. The only
+ * realistic case is a checkpoint's unlocked progress write (see
+ * job_write_progress()) landing at the same moment as an API-triggered
+ * header save (pause/cancel/etc, still made under queue_lock) for that
+ * same job; different jobs never share a path so never actually contend,
+ * but serializing everyone is simpler than a per-job lock and disk writes
+ * are effectively serialized by the hardware anyway. Distinct from
+ * queue_lock -- never held while trying to acquire it -- so it can't
+ * deadlock against anything that does the reverse. */
+static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Durably writes len bytes from buf to path via a temp-file+fsync+
+ * rename+dir-fsync sequence. Always frees buf, whether it succeeds or
+ * fails. Shared by every kind of job file (header/segments/progress) --
+ * none of them touch job_t itself, just the given buffer and the
+ * filesystem, which is what lets a caller (see job_write_progress())
+ * release whatever lock protects the job this was snapshotted from before
+ * calling this. Returns 0/-1 (already logged). */
+static int
+job_write_file(const char *job_id, const char *path, void *buf, size_t len) {
+  char tmp_path[700];
   FILE *f;
-  char *text;
-  size_t fi, si;
   int ok = 1;
 
-  cJSON_AddStringToObject(root, "id", job->id);
-  cJSON_AddStringToObject(root, "name", job->name);
-  cJSON_AddStringToObject(root, "state", job_state_name(job->state));
-  cJSON_AddNumberToObject(root, "priority", job->priority);
-  cJSON_AddNumberToObject(root, "retries_used", job->retries_used);
-  cJSON_AddStringToObject(root, "last_error", job->last_error);
-  cJSON_AddNumberToObject(root, "final_bytes", (double)job->final_bytes);
-  cJSON_AddStringToObject(root, "output_dir", job->output_dir);
-  cJSON_AddBoolToObject(root, "add_to_shadowmount", job->add_to_shadowmount);
-  cJSON_AddBoolToObject(root, "auto_install_pkgs", job->auto_install_pkgs);
-  cJSON_AddStringToObject(root, "nfo_path", job->nfo_path);
+  pthread_mutex_lock(&g_save_mu);
 
-  {
-    cJSON *passwords = cJSON_CreateArray();
-    for (fi = 0; fi < job->password_count; fi++) {
-      cJSON_AddItemToArray(passwords, cJSON_CreateString(job->passwords[fi]));
-    }
-    cJSON_AddItemToObject(root, "passwords", passwords);
+  snprintf(tmp_path, sizeof tmp_path, "%s.tmp", path);
+  if (!(f = fopen(tmp_path, "wb"))) {
+    log_error("[%s] job: fopen(%s): %s", job_id, tmp_path, strerror(errno));
+    free(buf);
+    pthread_mutex_unlock(&g_save_mu);
+    return -1;
+  }
+  if (len > 0 && fwrite(buf, 1, len, f) != len) ok = 0;
+  /* fsync before close: fclose() alone only reaches the page cache, and an
+   * unclean shutdown could let the rename() below land durably while these
+   * bytes are lost, leaving a correctly-named but truncated file. */
+  if (ok && fflush(f) != 0) ok = 0;
+  if (ok && fsync(fileno(f)) != 0) ok = 0;
+  if (fclose(f) != 0) ok = 0;
+  free(buf);
+
+  if (!ok) {
+    log_error("[%s] job: write error saving %s", job_id, path);
+    pthread_mutex_unlock(&g_save_mu);
+    return -1;
   }
 
-  {
-    cJSON *pkg_paths = cJSON_CreateArray();
-    for (fi = 0; fi < job->pkg_count; fi++) {
-      cJSON_AddItemToArray(pkg_paths, cJSON_CreateString(job->pkg_paths[fi]));
-    }
-    cJSON_AddItemToObject(root, "pkg_paths", pkg_paths);
+  if (rename(tmp_path, path) != 0) {
+    log_error("[%s] job: rename(%s, %s): %s", job_id, tmp_path, path, strerror(errno));
+    pthread_mutex_unlock(&g_save_mu);
+    return -1;
   }
+
+  /* rename() is itself a directory-metadata change; fsync the dir too so a
+   * crash right after can't lose it. Best-effort -- the file data is
+   * already safe. */
+  {
+    char dir_path[700];
+    char *slash;
+    int dirfd;
+
+    snprintf(dir_path, sizeof dir_path, "%s", path);
+    if ((slash = strrchr(dir_path, '/'))) {
+      *slash = 0;
+      if ((dirfd = open(dir_path, O_RDONLY)) >= 0) {
+        if (fsync(dirfd) != 0) {
+          log_warn("[%s] job: fsync(%s): %s", job_id, dir_path, strerror(errno));
+        }
+        close(dirfd);
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&g_save_mu);
+  return 0;
+}
+
+/* Builds job's file/segment structure ("files": [...], each with
+ * filename/subject/bytes and its segments' message_id/bytes/number, but
+ * deliberately no "downloaded" -- that lives in the ".progress" bitmap
+ * instead) as a malloc'd JSON string. Returns NULL on failure (already
+ * logged). */
+static char *
+job_segments_to_json_text(const job_t *job) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON *files = cJSON_CreateArray();
+  char *text;
+  size_t fi, si;
 
   cJSON_AddItemToObject(root, "files", files);
 
@@ -257,7 +399,6 @@ job_save(const job_t *job, const char *path) {
       cJSON_AddStringToObject(seg, "message_id", s->message_id);
       cJSON_AddNumberToObject(seg, "bytes", (double)s->bytes);
       cJSON_AddNumberToObject(seg, "number", s->number);
-      cJSON_AddBoolToObject(seg, "downloaded", s->downloaded);
 
       cJSON_AddItemToArray(segments, seg);
     }
@@ -268,56 +409,244 @@ job_save(const job_t *job, const char *path) {
   text = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
 
-  if (!text) {
-    log_error("[%s] job: failed to serialize", job->id);
-    return -1;
+  if (!text) log_error("[%s] job: failed to serialize segment structure", job->id);
+  return text;
+}
+
+/* Writes job's ".segments" sidecar if (and only if) it doesn't already
+ * exist -- a brand new job's first-ever save (see job_save()/
+ * job_write_progress()) always hits this, once; every save after that
+ * finds it already there and skips straight past.
+ *
+ * Reads job->files -- filename/subject/message_id/bytes/number, fixed at
+ * NZB-parse time (job_add_file()/job_file_add_segment(), both called only
+ * from nzb_parse.c, before the job is ever queued) and never mutated
+ * again by any code path -- so, like job->id elsewhere in this codebase,
+ * it's safe to read here without queue_lock even from job_write_progress()'s
+ * unlocked caller. Logs and returns on failure without treating it as
+ * fatal to the caller's own save: a missing sidecar just means this runs
+ * again next time. */
+static void
+job_ensure_segments_saved(const job_t *job, const char *json_path) {
+  char segments_path[700];
+  char *text;
+
+  job_sidecar_path(json_path, ".segments", segments_path, sizeof segments_path);
+  if (access(segments_path, F_OK) == 0) return;
+
+  if (!(text = job_segments_to_json_text(job))) return;
+  job_write_file(job->id, segments_path, text, strlen(text));
+}
+
+/* Builds job's ".progress" bitmap as a malloc'd buffer -- pure in-memory,
+ * no I/O, so the point of calling this separately from
+ * job_write_progress() is shrinking how long whatever lock protects job's
+ * fields (normally queue_lock) has to stay held. *out_len is the buffer's
+ * length in bytes (ceil(total segments / 8)). Returns NULL (leaving
+ * *out_len unset) only on allocation failure. */
+unsigned char *
+job_progress_snapshot(const job_t *job, size_t *out_len) {
+  size_t total = 0, fi, si, bit;
+  unsigned char *bitmap;
+
+  for (fi = 0; fi < job->file_count; fi++) total += job->files[fi].segment_count;
+
+  *out_len = (total + 7) / 8;
+  if (!(bitmap = calloc(*out_len ? *out_len : 1, 1))) return NULL;
+
+  bit = 0;
+  for (fi = 0; fi < job->file_count; fi++) {
+    const job_file_t *jf = &job->files[fi];
+
+    for (si = 0; si < jf->segment_count; si++, bit++) {
+      if (jf->segments[si].downloaded) bitmap[bit / 8] |= (unsigned char)(1u << (bit % 8));
+    }
   }
 
-  snprintf(tmp_path, sizeof tmp_path, "%s.tmp", path);
-  if (!(f = fopen(tmp_path, "w"))) {
-    log_error("[%s] job: fopen(%s): %s", job->id, tmp_path, strerror(errno));
-    free(text);
-    return -1;
-  }
-  if (fputs(text, f) == EOF) ok = 0;
-  /* fsync before close: fclose() alone only reaches the page cache, and an
-   * unclean shutdown could let the rename() below land durably while these
-   * bytes are lost, leaving a correctly-named but 0-byte job file. */
-  if (ok && fflush(f) != 0) ok = 0;
-  if (ok && fsync(fileno(f)) != 0) ok = 0;
-  if (fclose(f) != 0) ok = 0;
-  free(text);
+  return bitmap;
+}
 
-  if (!ok) {
-    log_error("[%s] job: write error saving %s", job->id, path);
-    return -1;
-  }
+/* Durably writes bitmap (a job_progress_snapshot() result -- this
+ * function takes ownership and frees it) as job_id's ".progress" sidecar
+ * next to json_path. Ensures the ".segments" sidecar exists first (see
+ * job_ensure_segments_saved()) since a progress bitmap is meaningless
+ * without the structure it lines up against. Unlike job_save(), touches
+ * nothing but the given buffer and the filesystem, so a caller doesn't
+ * need to keep holding whatever lock protects the job bitmap was
+ * snapshotted from -- see download.c's per-job checkpoint, the reason
+ * this split exists: even a bitmap this small is still real disk I/O, and
+ * every web API request needing queue_lock would otherwise queue up
+ * behind it. Returns 0/-1 (already logged). */
+int
+job_write_progress(const job_t *job, const char *json_path, unsigned char *bitmap, size_t len) {
+  char progress_path[700];
 
-  if (rename(tmp_path, path) != 0) {
-    log_error("[%s] job: rename(%s, %s): %s", job->id, tmp_path, path, strerror(errno));
-    return -1;
-  }
+  job_ensure_segments_saved(job, json_path);
+  job_sidecar_path(json_path, ".progress", progress_path, sizeof progress_path);
+  return job_write_file(job->id, progress_path, bitmap, len);
+}
 
-  /* rename() is itself a directory-metadata change; fsync the dir too so a
-   * crash right after can't lose it. Best-effort -- job data is already safe. */
+/* Builds job's header -- everything about it except its file/segment
+ * structure and download progress, both of which live in their own
+ * sidecars -- as a malloc'd JSON string. Small and O(1) in job size
+ * regardless of segment count: every state change (pause, cancel,
+ * download/verify/repair/extract/complete transitions, ...) rewrites
+ * this, and none of them should have to pay for a huge job's segment list
+ * to do it. Returns NULL on failure (already logged). */
+static char *
+job_header_to_json_text(const job_t *job) {
+  cJSON *root = cJSON_CreateObject();
+  char *text;
+  size_t i;
+
+  cJSON_AddStringToObject(root, "id", job->id);
+  cJSON_AddStringToObject(root, "name", job->name);
+  cJSON_AddStringToObject(root, "state", job_state_name(job->state));
+  cJSON_AddNumberToObject(root, "priority", job->priority);
+  cJSON_AddNumberToObject(root, "retries_used", job->retries_used);
+  cJSON_AddStringToObject(root, "last_error", job->last_error);
+  cJSON_AddNumberToObject(root, "final_bytes", (double)job->final_bytes);
+  cJSON_AddStringToObject(root, "output_dir", job->output_dir);
+  cJSON_AddBoolToObject(root, "add_to_shadowmount", job->add_to_shadowmount);
+  cJSON_AddBoolToObject(root, "auto_install_pkgs", job->auto_install_pkgs);
+  cJSON_AddStringToObject(root, "nfo_path", job->nfo_path);
+
   {
-    char dir_path[600];
-    char *slash;
-    int dirfd;
+    cJSON *passwords = cJSON_CreateArray();
+    for (i = 0; i < job->password_count; i++) {
+      cJSON_AddItemToArray(passwords, cJSON_CreateString(job->passwords[i]));
+    }
+    cJSON_AddItemToObject(root, "passwords", passwords);
+  }
 
-    snprintf(dir_path, sizeof dir_path, "%s", path);
-    if ((slash = strrchr(dir_path, '/'))) {
-      *slash = 0;
-      if ((dirfd = open(dir_path, O_RDONLY)) >= 0) {
-        if (fsync(dirfd) != 0) {
-          log_warn("[%s] job: fsync(%s): %s", job->id, dir_path, strerror(errno));
-        }
-        close(dirfd);
+  {
+    cJSON *pkg_paths = cJSON_CreateArray();
+    for (i = 0; i < job->pkg_count; i++) {
+      cJSON_AddItemToArray(pkg_paths, cJSON_CreateString(job->pkg_paths[i]));
+    }
+    cJSON_AddItemToObject(root, "pkg_paths", pkg_paths);
+  }
+
+  text = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+
+  if (!text) log_error("[%s] job: failed to serialize", job->id);
+  return text;
+}
+
+int
+job_save(const job_t *job, const char *path) {
+  char *text;
+
+  job_ensure_segments_saved(job, path);
+
+  if (!(text = job_header_to_json_text(job))) return -1;
+  return job_write_file(job->id, path, text, strlen(text));
+}
+
+/* Loads job's ".segments" and ".progress" sidecars (see job_sidecar_path()'s
+ * comment) into job, whose header job_load() already populated from
+ * json_path. A missing or corrupt segments sidecar leaves job with no
+ * files -- logged, but not fatal to loading the job itself. A missing or
+ * short progress sidecar just leaves the affected segments unmarked
+ * (re-fetched next run) rather than losing the job. */
+static void
+job_load_segments_and_progress(job_t *job, const char *json_path) {
+  char segments_path[700], progress_path[700];
+  FILE *f;
+  char *buf;
+  long size;
+  cJSON *root, *files, *file_item;
+  unsigned char *bitmap = NULL;
+  size_t bitmap_len = 0, bit = 0;
+
+  job_sidecar_path(json_path, ".segments", segments_path, sizeof segments_path);
+  job_sidecar_path(json_path, ".progress", progress_path, sizeof progress_path);
+
+  if (!(f = fopen(segments_path, "rb"))) {
+    log_error("[%s] job: fopen(%s): %s", job->id, segments_path, strerror(errno));
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size < 0 || !(buf = malloc((size_t)size + 1))) {
+    fclose(f);
+    return;
+  }
+  if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+    log_error("[%s] job: short read on %s", job->id, segments_path);
+    free(buf);
+    fclose(f);
+    return;
+  }
+  buf[size] = 0;
+  fclose(f);
+
+  root = cJSON_Parse(buf);
+  free(buf);
+  if (!root) {
+    log_error("[%s] job: invalid JSON in %s", job->id, segments_path);
+    return;
+  }
+
+  /* Read whole into memory up front -- typically at most a couple hundred
+   * KB even for a huge job -- rather than seeking per segment below. */
+  if ((f = fopen(progress_path, "rb"))) {
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size > 0 && (bitmap = malloc((size_t)size))) {
+      if (fread(bitmap, 1, (size_t)size, f) == (size_t)size) {
+        bitmap_len = (size_t)size;
+      } else {
+        free(bitmap);
+        bitmap = NULL;
+      }
+    }
+    fclose(f);
+  }
+  if (!bitmap) {
+    log_warn("[%s] job: no usable %s -- treating all segments as not yet downloaded",
+             job->id, progress_path);
+  }
+
+  files = cJSON_GetObjectItemCaseSensitive(root, "files");
+  cJSON_ArrayForEach(file_item, files) {
+    const cJSON *filename = cJSON_GetObjectItemCaseSensitive(file_item, "filename");
+    const cJSON *subject  = cJSON_GetObjectItemCaseSensitive(file_item, "subject");
+    const cJSON *segments = cJSON_GetObjectItemCaseSensitive(file_item, "segments");
+    const cJSON *seg_item;
+    job_file_t *jf;
+
+    jf = job_add_file(job,
+                       cJSON_IsString(filename) ? filename->valuestring : "",
+                       cJSON_IsString(subject) ? subject->valuestring : "");
+    if (!jf) continue;
+
+    cJSON_ArrayForEach(seg_item, segments) {
+      const cJSON *msgid  = cJSON_GetObjectItemCaseSensitive(seg_item, "message_id");
+      const cJSON *bytes  = cJSON_GetObjectItemCaseSensitive(seg_item, "bytes");
+      const cJSON *number = cJSON_GetObjectItemCaseSensitive(seg_item, "number");
+      /* Advance bit for every segment entry seen, valid or not, so a
+       * malformed entry can't desync the rest of this file's (or a later
+       * file's) bits from the ones job_progress_snapshot() actually
+       * meant -- see that function's comment for the ordering they share. */
+      int downloaded = bitmap && bit / 8 < bitmap_len && (bitmap[bit / 8] & (1u << (bit % 8)));
+      bit++;
+
+      if (!cJSON_IsString(msgid)) continue;
+
+      if (job_file_add_segment(jf, msgid->valuestring,
+                                cJSON_IsNumber(bytes) ? (long)bytes->valuedouble : 0,
+                                cJSON_IsNumber(number) ? number->valueint : 0) == 0) {
+        jf->segments[jf->segment_count - 1].downloaded = downloaded;
       }
     }
   }
 
-  return 0;
+  free(bitmap);
+  cJSON_Delete(root);
 }
 
 job_t *
@@ -325,7 +654,7 @@ job_load(const char *path) {
   FILE *f;
   char *buf;
   long size;
-  cJSON *root, *files, *file_item;
+  cJSON *root;
   job_t *job;
   const cJSON *id, *name, *state, *priority, *retries, *last_error, *final_bytes;
   const cJSON *output_dir, *add_to_shadowmount, *auto_install_pkgs, *nfo_path;
@@ -406,34 +735,9 @@ job_load(const char *path) {
     }
   }
 
-  files = cJSON_GetObjectItemCaseSensitive(root, "files");
-  cJSON_ArrayForEach(file_item, files) {
-    const cJSON *filename = cJSON_GetObjectItemCaseSensitive(file_item, "filename");
-    const cJSON *subject  = cJSON_GetObjectItemCaseSensitive(file_item, "subject");
-    const cJSON *segments = cJSON_GetObjectItemCaseSensitive(file_item, "segments");
-    const cJSON *seg_item;
-    job_file_t *jf;
-
-    jf = job_add_file(job,
-                       cJSON_IsString(filename) ? filename->valuestring : "",
-                       cJSON_IsString(subject) ? subject->valuestring : "");
-    if (!jf) continue;
-
-    cJSON_ArrayForEach(seg_item, segments) {
-      const cJSON *msgid      = cJSON_GetObjectItemCaseSensitive(seg_item, "message_id");
-      const cJSON *bytes      = cJSON_GetObjectItemCaseSensitive(seg_item, "bytes");
-      const cJSON *number     = cJSON_GetObjectItemCaseSensitive(seg_item, "number");
-      const cJSON *downloaded = cJSON_GetObjectItemCaseSensitive(seg_item, "downloaded");
-
-      if (!cJSON_IsString(msgid)) continue;
-
-      if (job_file_add_segment(jf, msgid->valuestring,
-                                cJSON_IsNumber(bytes) ? (long)bytes->valuedouble : 0,
-                                cJSON_IsNumber(number) ? number->valueint : 0) == 0) {
-        jf->segments[jf->segment_count - 1].downloaded = cJSON_IsTrue(downloaded);
-      }
-    }
-  }
+  /* File/segment structure and download progress live in their own
+   * sidecars -- see job_sidecar_path()'s comment. */
+  job_load_segments_and_progress(job, path);
 
   cJSON_Delete(root);
   return job;

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../extract/extract.h"
@@ -33,7 +34,8 @@
 #include "../yenc/yenc.h"
 #include "download.h"
 
-#define DL_CHECKPOINT_INTERVAL 25  /* persist job state every N segments completed */
+#define DL_CHECKPOINT_INTERVAL 25       /* persist job state every N segments completed, subject to... */
+#define DL_CHECKPOINT_MIN_INTERVAL_MS 2000  /* ...at least this long since the last one -- see segment_done_cb() */
 
 /* FIFO handoff from download_job() to finalizer_main() -- see top comment.
  * shutdown does not discard what's already queued (finalize_dequeue()
@@ -115,6 +117,7 @@ typedef struct {
   pthread_cond_t  cond;
   int             pending;
   int             since_checkpoint;
+  long long       last_checkpoint_ms;  /* CLOCK_MONOTONIC -- see segment_done_cb() */
 } job_dl_state_t;
 
 /* One per job_file_t, shared by every segment_ctx_t for that file for one
@@ -493,6 +496,8 @@ segment_done_cb(void *ctx, int status) {
 
   if (ok) {
     int checkpoint;
+    long long now_ms;
+    struct timespec ts;
 
     log_debug("[%s] download: segment %s: decoded %ld byte(s)",
               sc->job->id, sc->seg->message_id, sc->budget);
@@ -501,16 +506,41 @@ segment_done_cb(void *ctx, int status) {
     job_mark_segment_downloaded(sc->job, sc->seg->message_id);
     queue_unlock();
 
+    /* A checkpoint only rewrites job.c's compact ".progress" bitmap now
+     * (see queue_job_progress_snapshot()'s comment) -- not the whole job
+     * the way it used to -- but it's still real disk I/O on every Nth
+     * segment, and DL_CHECKPOINT_INTERVAL alone doesn't bound how often
+     * that runs: on a fast link, a huge job (hundreds of thousands of
+     * segments) can clear 25 of them many times a second. The time floor
+     * below caps checkpoint frequency to a constant rate regardless of job
+     * size or link speed; small/normal jobs are unaffected since 25
+     * segments already takes longer than the floor to complete for them. */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
     pthread_mutex_lock(&sc->st->mu);
     sc->st->since_checkpoint++;
-    checkpoint = sc->st->since_checkpoint >= DL_CHECKPOINT_INTERVAL;
-    if (checkpoint) sc->st->since_checkpoint = 0;
+    checkpoint = sc->st->since_checkpoint >= DL_CHECKPOINT_INTERVAL &&
+                 now_ms - sc->st->last_checkpoint_ms >= DL_CHECKPOINT_MIN_INTERVAL_MS;
+    if (checkpoint) {
+      sc->st->since_checkpoint = 0;
+      sc->st->last_checkpoint_ms = now_ms;
+    }
     pthread_mutex_unlock(&sc->st->mu);
 
     if (checkpoint) {
+      /* Snapshot under queue_lock (fast, in-memory), then release it
+       * before the actual disk write -- see
+       * queue_write_job_progress()'s comment for why, even though that
+       * write is now small regardless of job size. */
+      unsigned char *bitmap;
+      size_t len;
+
       queue_lock();
-      queue_save_job(g_app.queue, sc->job);
+      bitmap = queue_job_progress_snapshot(sc->job, &len);
       queue_unlock();
+
+      if (bitmap) queue_write_job_progress(g_app.queue, sc->job, bitmap, len);
     }
   }
 
@@ -548,6 +578,11 @@ download_segments(job_t *job, job_file_t **files, size_t file_count) {
   pthread_cond_init(&st.cond, NULL);
   st.pending = 0;
   st.since_checkpoint = 0;
+  {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    st.last_checkpoint_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+  }
 
   if (!(file_states = calloc(file_count, sizeof *file_states))) {
     log_error("[%s] download: out of memory", job->id);
@@ -1043,20 +1078,39 @@ job_auto_install_pkgs(job_t *job) {
 
 /* Moves src to dst: rename() first, falling back to copy+delete on EXDEV
  * (temp_dir/output_dir on different filesystems -- plausible with
- * multiple mounted USB drives). chmod's dst 0777 since files may arrive
- * with no executable bit, which matters for a PS5 homebrew ELF (see
- * extract.c's matching chmod). Returns 0 on success, -1 on failure
- * (already logged). */
+ * multiple mounted USB drives, and the case slow enough to need progress
+ * reported below). chmod's dst 0777 since files may arrive with no
+ * executable bit, which matters for a PS5 homebrew ELF (see extract.c's
+ * matching chmod).
+ *
+ * *done is the running byte count across every file finalize_job()'s
+ * EXTRACT_NONE loop moves, so cb (same shape as extract_progress_cb, used
+ * here so a slow cross-device copy shows up the same way a real
+ * extraction would -- see finalize_job()) reports one cumulative
+ * done/total across the whole move, not a per-file total that resets.
+ * The fast rename() path reports its file's whole size in one jump since
+ * it completes essentially instantly; the copy loop reports per chunk and
+ * -- like extract_job() -- aborts (returning -1) if cb signals a cancel
+ * mid-copy, without logging that as a real failure.
+ *
+ * Returns 0 on success, -1 on failure (already logged, unless cancelled). */
 static int
-move_file(const char *src, const char *dst) {
+move_file(const char *src, const char *dst, long long *done, long long total,
+          extract_progress_cb cb, void *cb_ctx) {
   FILE *in, *out;
   char buf[65536];
   size_t n;
-  int ok = 1;
+  int ok = 1, cancelled = 0;
 
   if (rename(src, dst) == 0) {
+    struct stat st;
+
     if (chmod(dst, 0777) != 0) {
       log_warn("download: chmod(%s, 0777): %s", dst, strerror(errno));
+    }
+    if (cb && stat(dst, &st) == 0) {
+      *done += (long long)st.st_size;
+      cb(cb_ctx, *done, total);
     }
     return 0;
   }
@@ -1077,6 +1131,10 @@ move_file(const char *src, const char *dst) {
 
   while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
     if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    if (cb) {
+      *done += (long long)n;
+      if (cb(cb_ctx, *done, total)) { ok = 0; cancelled = 1; break; }
+    }
   }
   if (ferror(in)) ok = 0;
 
@@ -1084,7 +1142,7 @@ move_file(const char *src, const char *dst) {
   if (fclose(out) != 0) ok = 0;
 
   if (!ok) {
-    log_error("download: copy %s -> %s failed: %s", src, dst, strerror(errno));
+    if (!cancelled) log_error("download: copy %s -> %s failed: %s", src, dst, strerror(errno));
     remove(dst);
     return -1;
   }
@@ -1165,12 +1223,16 @@ finalize_job(job_t *job, char *err, size_t err_size) {
 
   res = extract_job(job, temp_dir, dest_dir, extract_progress_update, job, err, err_size);
 
-  extract_lock();
-  g_app.extract_job_id[0] = 0;
-  extract_unlock();
-
-  if (res == EXTRACT_FAILED) return 0;
+  if (res == EXTRACT_FAILED) {
+    extract_lock();
+    g_app.extract_job_id[0] = 0;
+    extract_unlock();
+    return 0;
+  }
   if (res == EXTRACT_OK) {
+    extract_lock();
+    g_app.extract_job_id[0] = 0;
+    extract_unlock();
     log_info("[%s] download: extracted to %s", job->id, dest_dir);
     job->final_bytes = path_dir_total_bytes(dest_dir);
     if (job->add_to_shadowmount) shadowmount_register(job->id, dest_dir);
@@ -1179,16 +1241,32 @@ finalize_job(job_t *job, char *err, size_t err_size) {
   }
 
   /* EXTRACT_NONE -- no archive among this job's files; move its real
-   * content into the same destination directory instead. */
+   * content into the same destination directory instead. g_app.extract_job_id
+   * is deliberately left set (not cleared after extract_job() above, the
+   * way EXTRACT_FAILED/EXTRACT_OK do) and extract_bytes_done/total kept
+   * updating through move_file() below -- a cross-device move falls back
+   * to a real byte-for-byte copy (see move_file()) that can take a long
+   * time, and without this the job would sit at whatever the pre-extract
+   * download/verify totals showed (100%, since those are already done)
+   * with no visible progress until the whole copy finished. */
   {
     size_t fi;
+    long long total = 0, done = 0;
+    int ok = 1;
+
+    for (fi = 0; fi < job->file_count; fi++) {
+      if (!is_sidecar_file(job->files[fi].filename)) total += job->files[fi].bytes;
+    }
+    extract_lock();
+    g_app.extract_bytes_total = total;
+    extract_unlock();
 
     if (mkdir_p(dest_dir, 0755) < 0) {
       snprintf(err, err_size, "could not create output directory %s", dest_dir);
-      return 0;
+      ok = 0;
     }
 
-    for (fi = 0; fi < job->file_count; fi++) {
+    for (fi = 0; ok && fi < job->file_count; fi++) {
       const job_file_t *jf = &job->files[fi];
       char src[900], safe_name[512], dst[1200];
 
@@ -1199,11 +1277,17 @@ finalize_job(job_t *job, char *err, size_t err_size) {
       path_sanitize_component(safe_name, sizeof safe_name);
       snprintf(dst, sizeof dst, "%s/%s", dest_dir, safe_name);
 
-      if (move_file(src, dst) < 0) {
+      if (move_file(src, dst, &done, total, extract_progress_update, job) < 0) {
         snprintf(err, err_size, "could not move %s to the output directory", jf->filename);
-        return 0;
+        ok = 0;
       }
     }
+
+    extract_lock();
+    g_app.extract_job_id[0] = 0;
+    extract_unlock();
+
+    if (!ok) return 0;
 
     log_info("[%s] download: moved to %s", job->id, dest_dir);
   }
@@ -1272,10 +1356,11 @@ job_mark_stopped(job_t *job) {
 
 static void
 download_job(finalize_queue_t *fq, job_t *job) {
-  job_file_t **all_files;
-  size_t fi;
-  int all_ok;
+  job_file_t **phase_files;
+  size_t fi, phase_count;
+  int all_ok, verify_failed;
   char reach_err[256];
+  char verify_err[256];
 
   if (check_server_reachable(reach_err, sizeof reach_err) < 0) {
     log_error("[%s] download: %s - not attempting any segments", job->id, reach_err);
@@ -1321,7 +1406,12 @@ download_job(finalize_queue_t *fq, job_t *job) {
   queue_save_job(g_app.queue, job);
   queue_unlock();
 
-  if (!(all_files = malloc(job->file_count * sizeof *all_files))) {
+  /* PAR2 recovery volumes are pure redundancy -- fetched only if
+   * par2_verify_job() below actually finds damage (see
+   * job_file_is_par2_volume()). This first pass covers everything else: real
+   * content plus the small non-volume .par2 index file(s), which already
+   * carry every hash needed to verify. */
+  if (!(phase_files = malloc(job->file_count * sizeof *phase_files))) {
     log_error("[%s] download: out of memory", job->id);
     queue_lock();
     snprintf(job->last_error, sizeof job->last_error, "out of memory");
@@ -1330,19 +1420,24 @@ download_job(finalize_queue_t *fq, job_t *job) {
     queue_unlock();
     return;
   }
-  for (fi = 0; fi < job->file_count; fi++) all_files[fi] = &job->files[fi];
+  phase_count = 0;
+  for (fi = 0; fi < job->file_count; fi++) {
+    if (!job_file_is_par2_volume(job->files[fi].filename)) phase_files[phase_count++] = &job->files[fi];
+  }
 
-  download_segments(job, all_files, job->file_count);
-  free(all_files);
+  download_segments(job, phase_files, phase_count);
+  free(phase_files);
 
   if (!dl_should_continue(job)) {
     log_info("[%s] download: stopped (state is now %s)", job->id, job_state_name(job->state));
     return;
   }
 
-  /* Every file is already fully written (decoded, not yEnc-encoded)
-   * under storage.temp_dir/<job id>/ -- what's left is confirming every
-   * segment arrived, then PAR2-verifying the result. */
+  /* Every non-volume file is already fully written (decoded, not
+   * yEnc-encoded) under storage.temp_dir/<job id>/ -- what's left is
+   * confirming every segment arrived, then PAR2-verifying the result.
+   * Recovery volumes aren't held to this -- they're optional until verify
+   * below says otherwise, see the fetch below. */
   all_ok = 1;
   {
     char detail[256] = "";
@@ -1351,6 +1446,8 @@ download_job(finalize_queue_t *fq, job_t *job) {
     for (fi = 0; fi < job->file_count; fi++) {
       const job_file_t *jf = &job->files[fi];
       size_t total = 0, downloaded = 0, si;
+
+      if (job_file_is_par2_volume(jf->filename)) continue;
 
       for (si = 0; si < jf->segment_count; si++) {
         total++;
@@ -1377,55 +1474,127 @@ download_job(finalize_queue_t *fq, job_t *job) {
     }
   }
 
-  {
-    char verify_err[256];
+  /* job_busy_begin()/job_busy_end() bracket this blocking par2_verify_job()
+   * call so queue_remove_job() can't free job out from under it -- see
+   * job.h's busy comment. Recovery volumes, fetched below only if this
+   * finds damage, are network I/O like the phase_files download above and
+   * don't need the same protection (job->state == JOB_DOWNLOADING already
+   * keeps queue_remove_job() off it, same as during that first download). */
+  job_busy_begin(job);
+  verify_failed = !par2_verify_job(job, verify_err, sizeof verify_err);
+  if (verify_failed && (app_is_shutting_down() || job_was_cancelled(job))) {
+    job_busy_end(job);
+    job_mark_stopped(job);
+    return;
+  }
+  job_busy_end(job);
 
-    /* job_busy_begin()/job_busy_end() bracket this whole block (not just
-     * one call): queue_remove_job() must refuse to free job for as long as
-     * any of these blocking calls -- or the state/log writes right after
-     * one aborts -- might still touch it, see job.h's busy comment. */
-    job_busy_begin(job);
+  if (verify_failed) {
+    char repair_err[256];
 
-    if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
-      char repair_err[256];
+    log_warn("[%s] download (%s): PAR2 verify failed (%s) - fetching recovery volumes",
+             job->id, job->name, verify_err);
 
-      if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
+    /* par2_verify_job() left job->state at JOB_VERIFYING -- flip it back
+     * for the network fetch below so the state badge doesn't claim
+     * "Verifying" while it's actually pulling recovery volumes (and so
+     * the busy-comment invariant above actually holds). */
+    queue_lock();
+    job_set_state(job, JOB_DOWNLOADING);
+    queue_save_job(g_app.queue, job);
+    queue_unlock();
 
-      log_warn("[%s] download (%s): PAR2 verify failed (%s) - attempting repair",
-               job->id, job->name, verify_err);
-
-      if (!par2_repair_job(job, repair_err, sizeof repair_err)) {
-        if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
-        job_busy_end(job);
-        log_error("[%s] download (%s): %s", job->id, job->name, repair_err);
-        queue_lock();
-        snprintf(job->last_error, sizeof job->last_error, "%s", repair_err);
-        job_set_state(job, JOB_FAILED);
-        queue_save_job(g_app.queue, job);
-        queue_unlock();
-        return;
-      }
-
-      /* par2_repair_job() succeeding only means the reconstruction math
-       * and disk writes went through without a fatal error -- the real
-       * confirmation is re-running verify and having it actually pass. */
-      if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
-        if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
-        job_busy_end(job);
-        log_error("[%s] download (%s): repair completed but re-verification still failed - %s",
-                   job->id, job->name, verify_err);
-        queue_lock();
-        snprintf(job->last_error, sizeof job->last_error,
-                 "PAR2 repair completed but re-verification still failed: %s", verify_err);
-        job_set_state(job, JOB_FAILED);
-        queue_save_job(g_app.queue, job);
-        queue_unlock();
-        return;
-      }
-
-      log_info("[%s] download (%s): PAR2 repair succeeded, re-verified OK", job->id, job->name);
+    if (!(phase_files = malloc(job->file_count * sizeof *phase_files))) {
+      log_error("[%s] download: out of memory", job->id);
+      queue_lock();
+      snprintf(job->last_error, sizeof job->last_error, "out of memory");
+      job_set_state(job, JOB_FAILED);
+      queue_save_job(g_app.queue, job);
+      queue_unlock();
+      return;
+    }
+    phase_count = 0;
+    for (fi = 0; fi < job->file_count; fi++) {
+      if (job_file_is_par2_volume(job->files[fi].filename)) phase_files[phase_count++] = &job->files[fi];
     }
 
+    download_segments(job, phase_files, phase_count);
+    free(phase_files);
+
+    if (!dl_should_continue(job)) {
+      log_info("[%s] download: stopped (state is now %s)", job->id, job_state_name(job->state));
+      return;
+    }
+
+    /* Unlike the content check above, an incomplete volume here isn't
+     * fatal by itself -- par2_repair_job() just needs enough total
+     * recovery blocks across whatever volumes did land, the same way a
+     * volume this server never had (see the 430s that led here) wouldn't
+     * have sunk a repair that fetched every volume up front either. */
+    {
+      char detail[256] = "";
+      size_t detail_len = 0;
+      int any_incomplete = 0;
+
+      for (fi = 0; fi < job->file_count; fi++) {
+        const job_file_t *jf = &job->files[fi];
+        size_t total = 0, downloaded = 0, si;
+
+        if (!job_file_is_par2_volume(jf->filename)) continue;
+
+        for (si = 0; si < jf->segment_count; si++) {
+          total++;
+          if (jf->segments[si].downloaded) downloaded++;
+        }
+
+        if (downloaded < total) {
+          any_incomplete = 1;
+          if (detail_len < sizeof detail) {
+            detail_len += (size_t)snprintf(detail + detail_len, sizeof detail - detail_len,
+                                            "%s%s (%zu/%zu segments)", detail_len ? "; " : "",
+                                            jf->filename, downloaded, total);
+          }
+        }
+      }
+
+      if (any_incomplete) {
+        log_warn("[%s] download (%s): some recovery volume segments never arrived, repairing with "
+                 "what's on disk - %s", job->id, job->name, detail);
+      }
+    }
+
+    job_busy_begin(job);
+
+    if (!par2_repair_job(job, repair_err, sizeof repair_err)) {
+      if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
+      job_busy_end(job);
+      log_error("[%s] download (%s): %s", job->id, job->name, repair_err);
+      queue_lock();
+      snprintf(job->last_error, sizeof job->last_error, "%s", repair_err);
+      job_set_state(job, JOB_FAILED);
+      queue_save_job(g_app.queue, job);
+      queue_unlock();
+      return;
+    }
+
+    /* par2_repair_job() succeeding only means the reconstruction math
+     * and disk writes went through without a fatal error -- the real
+     * confirmation is re-running verify and having it actually pass. */
+    if (!par2_verify_job(job, verify_err, sizeof verify_err)) {
+      if (app_is_shutting_down() || job_was_cancelled(job)) { job_busy_end(job); job_mark_stopped(job); return; }
+      job_busy_end(job);
+      log_error("[%s] download (%s): repair completed but re-verification still failed - %s",
+                 job->id, job->name, verify_err);
+      queue_lock();
+      snprintf(job->last_error, sizeof job->last_error,
+               "PAR2 repair completed but re-verification still failed: %s", verify_err);
+      job_set_state(job, JOB_FAILED);
+      queue_save_job(g_app.queue, job);
+      queue_unlock();
+      return;
+    }
+
+    log_info("[%s] download (%s): PAR2 repair succeeded, re-verified OK", job->id, job->name);
     job_busy_end(job);
   }
 

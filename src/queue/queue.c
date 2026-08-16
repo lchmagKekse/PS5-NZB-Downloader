@@ -114,7 +114,11 @@ queue_open(const char *dir, const char *temp_dir) {
   while ((ent = readdir(d))) {
     char full[768];
 
-    if (has_suffix(ent->d_name, ".json.tmp")) {
+    /* Covers ".json.tmp" as well as a job's sidecar temp files
+     * (".segments.tmp"/".progress.tmp", see job.c's format comment) --
+     * job_write_file() always writes to "<path>.tmp" then renames, so any
+     * "*.tmp" found here is a write a crash caught mid-flight. */
+    if (has_suffix(ent->d_name, ".tmp")) {
       snprintf(full, sizeof full, "%s/%s", dir, ent->d_name);
       log_warn("queue: removing leftover incomplete write %s", full);
       remove(full);
@@ -212,6 +216,19 @@ queue_save_job(queue_t *q, const job_t *job) {
   return job_save(job, path);
 }
 
+unsigned char *
+queue_job_progress_snapshot(const job_t *job, size_t *out_len) {
+  return job_progress_snapshot(job, out_len);
+}
+
+int
+queue_write_job_progress(queue_t *q, const job_t *job, unsigned char *bitmap, size_t len) {
+  char path[600];
+
+  job_path(q, job->id, path, sizeof path);
+  return job_write_progress(job, path, bitmap, len);
+}
+
 int
 queue_add_job(queue_t *q, job_t *job) {
   char path[600];
@@ -257,10 +274,20 @@ queue_remove_job(queue_t *q, const char *id) {
       return -2;
     }
 
-    char path[600];
+    char path[600], sidecar[700];
     job_path(q, id, path, sizeof path);
     if (remove(path) != 0 && errno != ENOENT) {
       log_warn("[%s] queue: remove(%s): %s", id, path, strerror(errno));
+    }
+    /* Sidecars (see job.c's format comment) -- ENOENT here is normal for
+     * a job that never got past its header save, not worth logging. */
+    job_sidecar_path(path, ".segments", sidecar, sizeof sidecar);
+    if (remove(sidecar) != 0 && errno != ENOENT) {
+      log_warn("[%s] queue: remove(%s): %s", id, sidecar, strerror(errno));
+    }
+    job_sidecar_path(path, ".progress", sidecar, sizeof sidecar);
+    if (remove(sidecar) != 0 && errno != ENOENT) {
+      log_warn("[%s] queue: remove(%s): %s", id, sidecar, strerror(errno));
     }
 
     job_free(q->jobs[i]);

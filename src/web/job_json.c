@@ -15,6 +15,17 @@ progress_json(const job_t *job) {
     const job_file_t *jf = &job->files[fi];
     size_t si;
 
+    /* Mirrors job_segment_progress()'s exclusion of not-yet-fetched PAR2
+     * recovery volumes -- see job_file_is_par2_volume()'s comment. */
+    if (job_file_is_par2_volume(jf->filename)) {
+      int touched = 0;
+
+      for (si = 0; si < jf->segment_count; si++) {
+        if (jf->segments[si].downloaded) { touched = 1; break; }
+      }
+      if (!touched) continue;
+    }
+
     total_bytes += jf->bytes;
     for (si = 0; si < jf->segment_count; si++) {
       if (jf->segments[si].downloaded) downloaded_bytes += jf->segments[si].bytes;

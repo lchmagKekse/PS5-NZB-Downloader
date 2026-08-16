@@ -37,7 +37,7 @@ typedef enum {
   JOB_CANCELLED
 } job_state_t;
 
-#define JOB_ID_LEN 37  /* UUID string, e.g. "550e8400-e29b-41d4-a716-446655440000\0" */
+#define JOB_ID_LEN 13  /* 12 lowercase hex chars + \0, e.g. "a3f9c1e08b47\0" -- see generate_job_id() */
 
 #define JOB_MAX_PASSWORDS 8  /* some indexers list several guesses, not just one */
 
@@ -163,18 +163,57 @@ void job_set_state(job_t *job, job_state_t state);
  * exists in the job. */
 int job_mark_segment_downloaded(job_t *job, const char *message_id);
 
+/* True if filename matches PAR2 recovery *volume* naming
+ * ("<setname>.volNNN+MMM.par2") rather than the small non-volume ".par2"
+ * index file -- used by download.c to defer fetching recovery data until
+ * it's actually needed, and by job_segment_progress()/job_json.c to keep
+ * deferred volumes out of progress totals until they are. */
+int job_file_is_par2_volume(const char *filename);
+
 /* Fills *total and *downloaded with segment counts across every file in
  * the job, for progress reporting. */
 void job_segment_progress(const job_t *job, size_t *total, size_t *downloaded);
 
-/* Serializes job as JSON to path, writing to "<path>.tmp" and renaming over
- * path so a crash mid-write can't leave a corrupt/truncated job file.
- * fsyncs the tmp file before the rename and the dir after, so an unclean
- * shutdown can't lose the write once this returns 0. Returns 0 on success,
- * -1 on failure (already logged). */
+/* Persists job's header (state, priority, error, output settings, etc --
+ * everything except its file/segment structure and download progress,
+ * which live in their own "<path minus .json>.segments"/".progress"
+ * sidecars, written/updated separately -- see job.c's format comment for
+ * why) to path, writing to "<path>.tmp" and renaming over path so a crash
+ * mid-write can't leave a corrupt/truncated file. fsyncs the tmp file
+ * before the rename and the dir after, so an unclean shutdown can't lose
+ * the write once this returns 0. O(1) in job size regardless of segment
+ * count -- safe to call on every state change no matter how large the
+ * job is. Returns 0 on success, -1 on failure (already logged). */
 int job_save(const job_t *job, const char *path);
 
-/* Parses a job previously written by job_save(). Returns a newly
- * allocated job_t (caller must job_free() it), or NULL on failure
- * (already logged). */
+/* Snapshot half of a progress save -- builds job's download-progress
+ * bitmap (one bit per segment) as a malloc'd buffer, *out_len bytes long.
+ * Pure in-memory, no I/O, so the only reason to call this separately from
+ * job_write_progress() is to shrink how long whatever lock protects job's
+ * fields (normally queue_lock) has to stay held -- see download.c's
+ * per-job checkpoint, which does exactly that instead of using job_save()
+ * for every completed segment. Returns NULL (out_len left unset) only on
+ * allocation failure. */
+unsigned char *job_progress_snapshot(const job_t *job, size_t *out_len);
+
+/* Write half of a progress save -- durably writes bitmap (a
+ * job_progress_snapshot() result; this function takes ownership and frees
+ * it, len bytes) as job_id's ".progress" sidecar of json_path. Ensures
+ * the ".segments" sidecar exists first if this is the job's first save of
+ * any kind since it was created. Touches nothing but the given buffer and
+ * the filesystem, so unlike job_save() a caller doesn't need to keep
+ * holding whatever lock protected job while job_progress_snapshot() ran.
+ * Returns 0/-1 (already logged). */
+int job_write_progress(const job_t *job, const char *json_path, unsigned char *bitmap, size_t len);
+
+/* Parses a job previously written by job_save() and its ".segments"/
+ * ".progress" sidecars. Returns a newly allocated job_t (caller must
+ * job_free() it), or NULL on failure (already logged). */
 job_t *job_load(const char *path);
+
+/* Derives one of job's sidecar paths (suffix ".segments" or ".progress")
+ * from its canonical "<dir>/<id>.json" path -- e.g. for queue.c's
+ * queue_remove_job() to clean those up alongside the header. Neither
+ * suffix starts with ".json" so queue.c's "*.json" directory scan never
+ * mistakes one for a job header (see job.c's format comment). */
+void job_sidecar_path(const char *json_path, const char *suffix, char *out, size_t out_size);
