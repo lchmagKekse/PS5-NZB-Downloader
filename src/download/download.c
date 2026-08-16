@@ -124,15 +124,26 @@ typedef struct {
  * download_segments() call. fd opens lazily on the first segment to
  * actually start, not at dispatch time -- opening per-segment caused
  * EMFILE with hundreds/thousands of segments in flight and no
- * backpressure. Closed all together after dl_state_wait() drains
- * everything (see download_segments()), not via a per-file refcount --
- * segments of one file don't finish in dispatch order, so a naive
- * refcount could hit zero and close the fd while more are still coming. */
+ * backpressure. */
 typedef struct {
   pthread_mutex_t mu;
   int             fd;
   int             open_failed;
+  int             remaining;
 } file_dl_t;
+
+/* Decrements fs->remaining for one finished (or never-successfully-
+ * dispatched) segment and closes fs->fd once every segment counted in
+ * remaining has been accounted for. See file_dl_t comment. */
+static void
+file_dl_release(file_dl_t *fs) {
+  pthread_mutex_lock(&fs->mu);
+  if (--fs->remaining == 0 && fs->fd >= 0) {
+    close(fs->fd);
+    fs->fd = -1;
+  }
+  pthread_mutex_unlock(&fs->mu);
+}
 
 #define SEG_WBUF_SIZE 65536
 
@@ -545,6 +556,7 @@ segment_done_cb(void *ctx, int status) {
   }
 
   free(sc->wbuf);
+  file_dl_release(sc->fs);
   dl_state_done(sc->st);
   free(sc);
 }
@@ -606,6 +618,11 @@ download_segments(job_t *job, job_file_t **files, size_t file_count) {
     log_info("[%s] download: %s: %zu/%zu segment(s) already downloaded, fetching %zu more",
              job->id, jf->filename, already, jf->segment_count, jf->segment_count - already);
 
+    /* Fixed before any of this file's segments are dispatched below -- see
+     * file_dl_t comment for why this must be set up front rather than
+     * incremented per dispatch. */
+    fs->remaining = (int)(jf->segment_count - already);
+
     for (si = 0; si < jf->segment_count && dl_should_continue(job); si++) {
       job_segment_t *seg = &jf->segments[si];
       segment_ctx_t *sc;
@@ -637,6 +654,7 @@ download_segments(job_t *job, job_file_t **files, size_t file_count) {
         pool_unlock();
 
         if (rc < 0) {
+          file_dl_release(fs);
           dl_state_done(&st);
           free(sc);
         }
@@ -648,8 +666,10 @@ download_segments(job_t *job, job_file_t **files, size_t file_count) {
   pthread_mutex_destroy(&st.mu);
   pthread_cond_destroy(&st.cond);
 
-  /* Every dispatched segment has now finished -- safe to close every fd
-   * this run opened in one pass (see file_dl_t for why not incrementally). */
+  /* Fallback only -- file_dl_release() already closed every file's fd as
+   * soon as that file's own segments finished (see file_dl_t). This just
+   * mops up files a pause/cancel left with fewer segments dispatched than
+   * planned, whose remaining count never reached zero. */
   for (fi = 0; fi < file_count; fi++) {
     if (file_states[fi].fd >= 0) close(file_states[fi].fd);
     pthread_mutex_destroy(&file_states[fi].mu);
